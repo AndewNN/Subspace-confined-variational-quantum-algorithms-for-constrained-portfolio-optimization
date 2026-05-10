@@ -24,7 +24,6 @@ The repository contains:
   - `PO_X_Plateau.py`, `PO_new_Plateau.py` — barren-plateau diagnostics (variance scaling vs. qubit count).
   - `PO_new_ApproxRatio.py` — SC-QAOA approximation-ratio sweeps.
   - `PO_random_solution.py` — randomized admissible-portfolio reference cloud used in §08 of the paper.
-  - `adam.py` — Adam optimizer wrapper with cosine-annealing schedule used across experiments.
   - `make_fig2_trainability.py`, `make_fig3_ga_quality.py` — read the cached experiment outputs and produce the paper figures.
   - `models/` — small pickled artefacts (`gaussian_copula*.pkl`) used by the figure-generation scripts.
 - **`scripts/`** — three parameterized shell scripts that orchestrate the multi-configuration sweeps used to produce the paper's figures.
