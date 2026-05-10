@@ -1,238 +1,225 @@
-import numpy as np
-import pandas as pd
-import cudaq
-import sys
-import os
-import torch
-from tqdm import tqdm
-import shutil
+"""Barren-plateau diagnostics for the X-mixer (soft-penalty) baseline.
+
+For each (qubit count, asset count) configuration, samples N random parameter
+points and evaluates ⟨H⟩, accumulating the running sum and sum-of-squares
+needed to compute the variance scaling that diagnoses barren plateaus
+(see §03b of the paper).
+"""
+from __future__ import annotations
+
 import argparse
-sys.path.append(os.path.abspath(".."))
-from Utils.qaoaCUDAQ import po_normalize, ret_cov_to_QUBO, qubo_to_ising, process_ansatz_values,\
-    basis_T_to_pauli, reversed_str_bases_to_init_state, kernel_qaoa_Preserved, kernel_qaoa_X, kernel_flipped, get_optimizer, find_budget,\
-    all_state_to_return, get_init_states, write_df, clip_df
+import os
 
 import joblib
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
 
-cudaq.set_target("nvidia")
-pd.set_option('display.width', 1000)
-np.random.seed(109)
-rand_state = np.random.get_state()
-np.random.seed(50)
-state = np.random.get_state()
+import cudaq
 
-report_col = ["N", "Sum_1", "Sum_2"]
+import _paths  # noqa: F401  (puts project root on sys.path for ``from Utils.…``)
+from Utils.qaoaCUDAQ import (
+    find_budget,
+    kernel_qaoa_X,
+    po_normalize,
+    process_ansatz_values,
+    qubo_to_ising,
+    ret_cov_to_QUBO,
+    write_df,
+)
 
-LOOP = 100
-N = 2000
-oversample_factor = 5
-over_budget_bound = 1.0 # valid budget in [0, B * over_budget_bound]
-min_P, max_P = 125, 250
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-def file_copy(src, dst):
-    try:
-        shutil.copyfile(src, dst)
-    except shutil.SameFileError:
-        pass
+REPORT_COL = ["N", "Sum_1", "Sum_2"]
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Experiment parameter sweep")
+# How many (qubit, asset) loop iterations to run by default.
+DEFAULT_LOOP_COUNT = 100
 
-    # Qubits (list of ints)
-    parser.add_argument(
-        "-Q", "--qubit",
-        nargs="+", type=int, default=[5],
-        help="List of target qubits, e.g. -Q 4 5 6"
-    )
+# Default number of random parameter points sampled per (qubit, asset) cell.
+DEFAULT_NUM_SAMPLES = 2000
 
-    # Assets (list of ints)
-    parser.add_argument(
-        "-A", "--asset",
-        nargs="+", type=int, default=[3, 4, 5],
-        help="List of asset counts, e.g. -A 3 4 5"
-    )
+# Pull this many candidate samples from the GaussianCopula model before
+# filtering by the [min_P, max_P] price band, to ensure enough survive.
+OVERSAMPLE_FACTOR = 5
 
-    # Lambda
-    parser.add_argument(
-        "-L", "--lamb",
-        type=float, default=4.0,
-        help="Budget Penalty (float)"
-    )
+# Acceptable price band for the synthetic asset universe (USD).
+MIN_PRICE, MAX_PRICE = 125, 250
 
-    # Volatility
-    parser.add_argument(
-        "-q",
-        type=float, default=0.0,
-        help="Volatility Weight (float)"
-    )
+# Random seeds. 109 produces the reusable RNG snapshot used to redraw QAOA
+# parameter points inside the inner loop; 50 produces the RNG snapshot used
+# to draw the per-experiment asset cloud from the GaussianCopula models.
+# Both must remain fixed across runs to keep results reproducible.
+SEED_PARAM_DRAW = 109
+SEED_SAMPLE_CLOUD = 50
 
-    # QAOA Layers
-    parser.add_argument(
-        "-l", "--layer",
-        type=int, default=5,
-        help="Number of QAOA layers (int)"
-    )
+# Pre-fitted GaussianCopula models for the asset universe (price/return)
+# and covariance entries. See Utils.qaoaCUDAQ + the make_fig*.py scripts
+# for how they are built.
+COPULA_PRICE_RETURN_PKL = "./models/gaussian_copula.pkl"
+COPULA_COVARIANCE_PKL = "./models/gaussian_copula_covariance.pkl"
 
-    # start iter
-    # parser.add_argument(
-    #     "-st", "--start_iter",
-    #     type=int, default=0,
-    #     help="Number of iterations (int)"
-    # )
 
-    # end iter (run from start to end-1)
-    parser.add_argument(
-        "-ed", "--end_iter",
-        type=int, default=LOOP,
-        help="Number of iterations (int)"
-    )
-
-    # Number of samples
-    parser.add_argument(
-        "-N",
-        type=int, default=N,
-        help="Number of Samples (int)"
-    )
-
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Barren-plateau sweep (X-mixer baseline)")
+    parser.add_argument("-Q", "--qubit", nargs="+", type=int, default=[5],
+                        help="Target qubit counts, e.g. -Q 4 5 6")
+    parser.add_argument("-A", "--asset", nargs="+", type=int, default=[3, 4, 5],
+                        help="Asset counts, e.g. -A 3 4 5")
+    parser.add_argument("-L", "--lamb", type=float, default=4.0,
+                        help="Budget penalty λ")
+    parser.add_argument("-q", type=float, default=0.0,
+                        help="Volatility weight q")
+    parser.add_argument("-l", "--layer", type=int, default=5,
+                        help="Number of QAOA layers")
+    parser.add_argument("-ed", "--end_iter", type=int, default=DEFAULT_LOOP_COUNT,
+                        help="Run iterations [0, end_iter)")
+    parser.add_argument("-N", type=int, default=DEFAULT_NUM_SAMPLES,
+                        help="Number of random parameter points per cell")
     return parser.parse_args()
 
-args = parse_args()
 
-# HYPER PARAMETERS
-TARGET_QUBIT_IN = args.qubit
-N_ASSETS_IN = args.asset
-LAMB = args.lamb # Budget Penalty
-Q = args.q # Volatility Weight
-LAYER = args.layer
-iter_start = 0
-iter_end = args.end_iter
-N = args.N
-
-# with open("rng_state.pkl", "rb") as f:
-#     state = pickle.load(f)
-np.random.set_state(state)
-GM_loaded = joblib.load('./models/gaussian_copula.pkl')
-# samples = GM_loaded.sample(50)
-samples = GM_loaded.sample(int(max(N_ASSETS_IN) * LOOP * oversample_factor))
-samples = samples[(samples["Price"] > min_P) & (samples["Price"] < max_P)]
-# print(samples["Average_Return"].min(), samples["Average_Return"].max())
-# print(samples["Price"].min(), samples["Price"].max())
-print(samples.shape)
-samples = samples.to_numpy()
-assert samples.shape[0] > max(N_ASSETS_IN) * LOOP, "Please increase the oversample factor to get more samples ;-;"
-# sns.jointplot(data=samples, x='Price', y='Average_Return', kind='reg')
-# samples = samples.to_numpy()
-# plt.show()
+def _format_param(value: float) -> str:
+    """Format a numeric param as int when it has no fractional part."""
+    return str(int(value)) if value.is_integer() else str(value)
 
 
-np.random.set_state(state)
-GM_cov_loaded = joblib.load('./models/gaussian_copula_covariance.pkl')
-samples_cov = GM_cov_loaded.sample(int(max(N_ASSETS_IN) * LOOP))
-samples_cov = samples_cov.to_numpy()
-samples_cov = np.abs(samples_cov)
+def _draw_asset_universe(target_qubit_in, n_assets_in, num_samples_per_cell, sample_state):
+    """Draw and filter the (price, return) and covariance samples used by the loop."""
+    np.random.set_state(sample_state)
+    price_return = joblib.load(COPULA_PRICE_RETURN_PKL).sample(
+        int(max(n_assets_in) * DEFAULT_LOOP_COUNT * OVERSAMPLE_FACTOR)
+    )
+    price_return = price_return[
+        (price_return["Price"] > MIN_PRICE) & (price_return["Price"] < MAX_PRICE)
+    ]
+    price_return = price_return.to_numpy()
+    assert price_return.shape[0] > max(n_assets_in) * DEFAULT_LOOP_COUNT, (
+        "Increase OVERSAMPLE_FACTOR — not enough samples after price filtering"
+    )
+
+    np.random.set_state(sample_state)
+    covariance = joblib.load(COPULA_COVARIANCE_PKL).sample(
+        int(max(n_assets_in) * DEFAULT_LOOP_COUNT)
+    )
+    covariance = np.abs(covariance.to_numpy())
+
+    return price_return, covariance
 
 
-##########################################################################################
+def main() -> None:
+    cudaq.set_target("nvidia")
+    pd.set_option("display.width", 1000)
 
-# DO NOT INTERFERE loop_state TO LET EACH SETUP SYNCHRONIZED
+    args = parse_args()
+    target_qubit_in = args.qubit
+    n_assets_in = args.asset
+    lamb = args.lamb
+    q_weight = args.q
+    layer_count = args.layer
+    iter_end = args.end_iter
+    num_samples = args.N
 
-##########################################################################################
+    # Build two RNG snapshots: one for in-loop parameter draws, one for
+    # the up-front asset-universe sample. They must not be interleaved —
+    # the per-iteration `set_state` calls below restore each snapshot
+    # explicitly so the two streams stay synchronised across runs.
+    np.random.seed(SEED_PARAM_DRAW)
+    param_draw_state = np.random.get_state()
+    np.random.seed(SEED_SAMPLE_CLOUD)
+    sample_cloud_state = np.random.get_state()
 
-np.random.set_state(state)
-state_init_loop = np.random.get_state()
+    samples, samples_cov = _draw_asset_universe(
+        target_qubit_in, n_assets_in, num_samples, sample_cloud_state
+    )
+    print(f"Drew {samples.shape[0]} (price, return) samples after price filter")
 
-for TARGET_QUBIT in TARGET_QUBIT_IN:
-    for N_ASSETS in N_ASSETS_IN:
-        if TARGET_QUBIT < N_ASSETS:
-            continue
+    # Snapshot the RNG state at the entry of the (qubit, asset) sweep so
+    # each (qubit, asset) cell starts from an identical RNG state.
+    np.random.set_state(sample_cloud_state)
+    state_init_loop = np.random.get_state()
 
-        print(f"Target Qubit: {TARGET_QUBIT}, N Assets: {N_ASSETS}, L: {LAMB}, q: {Q}, layers: {LAYER}, N: {N}, ST: {iter_start}, ED: {iter_end}")
-        f_Q = Q if not Q.is_integer() else int(Q)
-        f_LAMB = LAMB if not LAMB.is_integer() else int(LAMB)
-        dir_name = f"exp_Q{TARGET_QUBIT}_A{N_ASSETS}_L{f_LAMB}_q{f_Q}"
-        dir_path = f"./experiments_plateau_X/{dir_name}"
-        
-        os.makedirs(dir_path, exist_ok=True)
+    for target_qubit in target_qubit_in:
+        for n_assets in n_assets_in:
+            if target_qubit < n_assets:
+                continue
 
-        np.random.set_state(state_init_loop)
-        loop_state = np.random.get_state()
-        restore_iter = iter_start
+            print(
+                f"Target Qubit: {target_qubit}, N Assets: {n_assets}, L: {lamb}, "
+                f"q: {q_weight}, layers: {layer_count}, N: {num_samples}, ED: {iter_end}"
+            )
+            dir_name = (
+                f"exp_Q{target_qubit}_A{n_assets}"
+                f"_L{_format_param(lamb)}_q{_format_param(q_weight)}"
+            )
+            dir_path = f"./experiments_plateau_X/{dir_name}"
+            os.makedirs(dir_path, exist_ok=True)
 
-        # for i in range(restore_iter):
-        #     np.random.rand(N_ASSETS, N_ASSETS)
-        #     np.random.uniform(-np.pi / 8, np.pi / 8, LAYER * 4)
-        
-        # loop_state = np.random.get_state()
-        
-        pbar = tqdm(range(restore_iter, iter_end))
-        for i in pbar:
-            pbar.set_description(f"X:init_1")
-            P = samples[i * N_ASSETS:(i + 1) * N_ASSETS, 0]
-            ret = samples[i * N_ASSETS:(i + 1) * N_ASSETS, 1]
-            # np.random.set_state(loop_state)
-            # cov = np.random.rand(N_ASSETS, N_ASSETS)
-            # cov += cov.T
-            cov = samples_cov[i * N_ASSETS:(i + 1) * N_ASSETS, :N_ASSETS]
-            for j in range(cov.shape[0]):
-                cov[j] = np.roll(cov[j], j)
-            cov = (cov + cov.T) / 2
-            # loop_state = np.random.get_state()
+            np.random.set_state(state_init_loop)
 
-            q = Q # Volatility Weight
-            B = find_budget(TARGET_QUBIT, P, min_P, max_P)
+            pbar = tqdm(range(iter_end))
+            for i in pbar:
+                pbar.set_description("X:init_1")
+                price = samples[i * n_assets:(i + 1) * n_assets, 0]
+                returns = samples[i * n_assets:(i + 1) * n_assets, 1]
+                cov = samples_cov[i * n_assets:(i + 1) * n_assets, :n_assets]
+                for j in range(cov.shape[0]):
+                    cov[j] = np.roll(cov[j], j)
+                cov = (cov + cov.T) / 2
 
-            P_bb, ret_bb, cov_bb, n_qubit, n_max, C = po_normalize(B, P, ret, cov)
-            # state_return, in_budget = all_state_to_return(B, C, ret, P, over_budget_bound)
+                budget = find_budget(target_qubit, price, MIN_PRICE, MAX_PRICE)
+                P_bb, ret_bb, cov_bb, n_qubit, _, _ = po_normalize(budget, price, returns, cov)
 
-            pbar.set_description(f"X:init_2")
-            lamb = LAMB
+                pbar.set_description("X:init_2")
+                qubo = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q_weight)
+                hamiltonian = qubo_to_ising(qubo, lamb).canonicalize()
+                idx_1, c1, idx_2_a, idx_2_b, c2 = process_ansatz_values(hamiltonian)
+                c1, c2 = np.array(c1), np.array(c2)
 
-            QU = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q)
-            H = qubo_to_ising(QU, lamb).canonicalize()
-            idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use = process_ansatz_values(H)
+                # Scale the random θ-range for the QUBO term by π / |smallest non-zero
+                # coefficient|, so the parameter draw covers a meaningful slice of the
+                # cost-Hamiltonian phase space without underflowing on small couplings.
+                min_abs_coeff = min(
+                    np.min(np.abs(c1)) if len(c1) else 1e9,
+                    np.min(np.abs(c2)) if len(c2) else 1e9,
+                )
+                theta_scale = np.pi / min_abs_coeff
 
-            coeff_1_use, coeff_2_use = np.array(coeff_1_use), np.array(coeff_2_use)
-            mm_1 = np.min(np.abs(coeff_1_use)) if len(coeff_1_use) > 0 else 1e9
-            mm_2 = np.min(np.abs(coeff_2_use)) if len(coeff_2_use) > 0 else 1e9
-            mm = min(mm_1, mm_2)
-            mm_i = np.pi / mm
+                parameter_count = layer_count * 2
+                ansatz_fixed_param = (
+                    int(n_qubit), layer_count, idx_1, c1, idx_2_a, idx_2_b, c2,
+                )
 
+                # Resume from a partial run if a report.csv already covers this cell.
+                report_path = f"{dir_path}/report.csv"
+                resume_iter, sum_1, sum_2 = 0, 0.0, 0.0
+                df_now = pd.read_csv(report_path) if os.path.exists(report_path) else None
+                if df_now is not None and df_now.shape[0] > i:
+                    if df_now.iloc[i]["N"] >= num_samples:
+                        continue
+                    resume_iter, sum_1, sum_2 = df_now.iloc[i]
+                    resume_iter = int(resume_iter)
 
-            kernel_qaoa_use = kernel_qaoa_X
+                np.random.set_state(param_draw_state)
+                points = np.random.uniform(-1, 1, (num_samples, parameter_count))
+                points[:, ::2] *= theta_scale
+                points[:, 1::2] *= np.pi
 
-            idx = 3
-            layer_count = LAYER
-            parameter_count = layer_count * 2
-            ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use)
-            it_st, sum_1, sum_2 = 0, 0.0, 0.0
-            df_now = pd.read_csv(f"{dir_path}/report.csv") if os.path.exists(f"{dir_path}/report.csv") else None
-            if df_now is not None and df_now.shape[0] > i:
-                if df_now.iloc[i]['N'] >= N:
-                    # np.random.uniform(-np.pi / 8, np.pi / 8, 4 * LAYER)
-                    # loop_state = np.random.get_state()
-                    continue
-                it_st, sum_1, sum_2 = df_now.iloc[i]
-                it_st = int(it_st)
-            
-            np.random.set_state(rand_state)
-            points = np.random.uniform(-1, 1, (N, parameter_count))
-            points[:, ::2] *= mm_i
-            points[:, 1::2] *= np.pi
+                pbar.set_description("X:observing")
+                expectations = []
+                for ii in tqdm(range(resume_iter, num_samples), leave=False):
+                    expectations.append(float(
+                        cudaq.observe(
+                            kernel_qaoa_X, hamiltonian, points[ii], *ansatz_fixed_param,
+                        ).expectation()
+                    ))
+                expectations = np.array(expectations)
+                sum_1 += expectations.sum()
+                sum_2 += (expectations ** 2).sum()
 
-            expectations = []
-
-            pbar.set_description(f"X:observing")
-            for ii in tqdm(range(it_st, N), leave=False):
-                expectations.append(float(cudaq.observe(kernel_qaoa_use, H, points[ii], *ansatz_fixed_param).expectation()))
-            expectations = np.array(expectations)
-            sum_1 += expectations.sum()
-            sum_2 += (expectations**2).sum()
-
-            # dff = pd.DataFrame(np.array([iter_end, sum_1, sum_2]).reshape(1, -1), columns=report_col)
-            # dff.to_csv(f"{dir_path}/report.csv", index=False)
-            write_df(f"{dir_path}/report.csv", report_col, N, sum_1, sum_2, idx=i)
+                write_df(report_path, REPORT_COL, num_samples, sum_1, sum_2, idx=i)
 
 
-            # np.random.set_state(loop_state)
-            # np.random.uniform(-np.pi / 8, np.pi / 8, 4 * LAYER) # Reserved for params of X and Preserving hamiltonian
-            # loop_state = np.random.get_state()
+if __name__ == "__main__":
+    main()
