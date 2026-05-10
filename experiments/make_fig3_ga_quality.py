@@ -1,34 +1,36 @@
 """Generate Fig. 3 (GA timing & quality) from cached experiment outputs.
 
-Run from the experiments/ directory so the relative paths
-./models/, ./output_PO_*, and ../dataset/ resolve identically
-to the original notebook.
+Run from the experiments/ directory so relative paths to ../dataset/ and
+./models/ resolve correctly.
 """
 
-# %% [code cell 1]
 import numpy as np
 import pandas as pd
 import cudaq
-from cudaq import spin
-from typing import List, Tuple
 import matplotlib.pyplot as plt
 import sys
 import os
-sys.path.append(os.path.abspath(".."))
-from Utils.qaoaCUDAQ import po_normalize, ret_cov_to_QUBO, qubo_to_ising, process_ansatz_values, state_to_return, kernel_qaoa_X, get_optimizer,\
-    optimizer_names
+
+import _paths  # noqa: F401
+from Utils.qaoaCUDAQ import (
+    get_optimizer,
+    kernel_qaoa_X,
+    optimizer_names,
+    po_normalize,
+    process_ansatz_values,
+    qubo_to_ising,
+    ret_cov_to_QUBO,
+    state_to_return,
+)
 
 import time
 
 cudaq.set_target("nvidia")
 
-# %% [markdown]
 # # HAMILTONIAN BY CUDAQ
 
-# %% [markdown]
 # ### by random values
 
-# %% [code cell 2]
 B = 100
 ret = np.array([1.0, 1.25, 1.5])
 cov = np.random.rand(3, 3)
@@ -46,7 +48,6 @@ print("n_qubit:", n_qubit)
 QU = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q)
 H = qubo_to_ising(QU, lamb)
 
-# %% [code cell 3]
 print("Hamiltonian:", H)
 idx_1, coeff_1, idx_2_a, idx_2_b, coeff_2 = process_ansatz_values(H)
 
@@ -56,10 +57,8 @@ print(idx_2_a)
 print(idx_2_b)
 print(coeff_2)
 
-# %% [markdown]
 # ### by stock values
 
-# %% [code cell 4]
 data_cov = pd.read_csv("../dataset/top_50_us_stocks_data_20250526_011226_covariance.csv")
 data_ret_p = pd.read_csv("../dataset/top_50_us_stocks_returns_price.csv")
 
@@ -93,7 +92,6 @@ print(data_ret.round(5))
 print(data_p.round(2))
 print(stock_names)
 
-# %% [code cell 5]
 P_bb, ret_bb, cov_bb, n_qubit, n_max, C = po_normalize(B, data_p, data_ret, data_cov)
 
 print("n_qubit:", n_qubit)
@@ -101,7 +99,6 @@ print("n_qubit:", n_qubit)
 QU = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q)
 H = qubo_to_ising(QU, lamb).canonicalize()
 
-# %% [code cell 6]
 print(H)
 idx_1, coeff_1, idx_2_a, idx_2_b, coeff_2 = process_ansatz_values(H)
 
@@ -111,10 +108,8 @@ print(idx_2_a)
 print(idx_2_b)
 print(coeff_2)
 
-# %% [markdown]
 # # CUDA QAOA
 
-# %% [code cell 7]
 @cudaq.kernel
 def realAmplitudeAnsatz(qreg: cudaq.qvector, qubit_count: int, ansatz: int, alpha: float):
     if ansatz == 0:
@@ -136,20 +131,16 @@ def kernel_qaoa(qubit_count: int, layer_count: int, thetas: List[float], ansatz:
         realAmplitudeAnsatz(qreg, qubit_count, ansatz, thetas[i])
         mixingAnsatz(qreg, qubit_count, thetas[layer_count + i])
 
-# %% [code cell 8]
 # print(cudaq.draw(kernel_qaoa, 4, 2, [0.1]*4, 0))
 
-# %% [code cell 9]
 idx_1_use, coeff_1_use = idx_1, coeff_1
 idx_2_a_use, idx_2_b_use, coeff_2_use = idx_2_a, idx_2_b, coeff_2
 
 # idx_1_use, coeff_1_use = idx_1_qis, coeff_1_qis
 # idx_2_a_use, idx_2_b_use, coeff_2_use = idx_2_a_qis, idx_2_b_qis, coeff_2_qis
 
-# %% [code cell 10]
 print(H)
 
-# %% [code cell 11]
 coeff_1_use = np.array(coeff_1_use)
 coeff_2_use = np.array(coeff_2_use)
 print(coeff_1_use)
@@ -161,20 +152,16 @@ mm_i = np.pi / mm
 print(coeff_1_use * mm_i)
 print(coeff_2_use * mm_i, end="\n\n")
 
-# %% [code cell 12]
 tt = np.zeros(10)
 tt[::2] = np.random.uniform(-mm_i, mm_i, 5)
 tt[1::2] = np.pi
 print(tt)
 
-# %% [code cell 13]
 print(cudaq.draw(kernel_qaoa_X, tt, n_qubit, 1, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use)) 
 # print(cudaq.draw(kernel_qaoa_X, [-mm_i, np.pi], n_qubit, 1, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use))
 
-# %% [markdown]
 # # Ansatz Architecture
 
-# %% [code cell 14]
 idx = 3
 layer_count = 5
 
@@ -183,16 +170,13 @@ optimizer, optimizer_name, FIND_GRAD = get_optimizer(idx)
 
 optimizer.max_iterations = 1000
 
-
 optimizer.initial_parameters = np.random.uniform(-np.pi / 8, np.pi / 8, parameter_count)
 print("Initial parameters = ", optimizer.initial_parameters)
 
 ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use)
 
-# %% [markdown]
 # # Optimize
 
-# %% [code cell 15]
 expectations = []
 
 def cost_func(parameters):
@@ -215,7 +199,6 @@ def objective_grad_cuda(parameters):
 objective_func = objective_grad_cuda if FIND_GRAD else objective
 print("Required Gradient = ", FIND_GRAD)
 
-# %% [code cell 16]
 st = time.time()
 optimal_expectation, optimal_parameters = optimizer.optimize(
     dimensions=parameter_count, function=objective_func)
@@ -229,7 +212,6 @@ print('optimal_expectation =', optimal_expectation)
 print('optimal_parameters =', optimal_parameters)
 print('Time taken = ', et - st)
 
-# %% [code cell 17]
 shots_count = int(1e6)
 print(f"Sampling {shots_count} times...")
 # result = cudaq.sample(kernel_qaoa, int(n_qubit), layer_count, optimal_parameters, 0, shots_count=shots_count)
@@ -245,7 +227,6 @@ print(idx_b2, result[idx_b2], result[idx_b2]/shots_count)
 # print(idx_r_b2, result[idx_r_b2], result[idx_r_b2]/shots_count)
 print("|q0>|q1>|q2>...")
 
-# %% [code cell 18]
 state = cudaq.get_state(kernel_qaoa_X, optimal_parameters, *ansatz_fixed_param)
 # print(state)
 
@@ -279,15 +260,12 @@ ex_ret = df["Return"].to_numpy()
 print("Best state:", state_best, "Return:", return_best)
 print("Most probable state:", state_high, "Return:", return_high)
 
-# %% [code cell 19]
 assert False
 
-# %% [code cell 20]
 result_final = np.zeros(2**n_qubit)
 for i in result:
     result_final[int(i, 2)] = result[i]
 
-# %% [code cell 21]
 plt.figure(figsize=(100, 15))
 x = np.arange(2**n_qubit)
 # plt.figure(figsize=(15, 5))
@@ -309,7 +287,6 @@ for i, s in enumerate(ex_ret):
 
 plt.show()
 
-# %% [code cell 22]
 plt.figure(figsize=(20, 10))
 for i in range(len(optimizer_names)):
     if os.path.exists(f"./output_PO/expectations_{optimizer_names[i]}.npy"):
