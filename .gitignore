@@ -24,9 +24,9 @@ env/
 # Experiment artefacts
 output/
 output_PO/
+output_PO_mixer/
 results/
 experiments_*/
-models/
 dataset/
 *.npy
 *.cbin

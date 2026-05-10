@@ -18,15 +18,17 @@ We replace the standard QAOA penalty term `λ · H_penalty` with a *preserving m
 The repository contains:
 
 - **`Utils/`** — core QAOA / Markowitz utilities (`qaoaCUDAQ.py`), graph construction, and solver helpers built on top of [CUDA-Q](https://github.com/NVIDIA/cuda-quantum).
-- **`ga_solver/`** — a C++ / pybind11 extension implementing the genetic algorithm used to identify the low-violation working subspace `S_ε`. Brute-force baseline (`BF_benchmark.cpp`) is included for comparison.
-- **`experiments/`** — runnable Python scripts for the three experiment families:
+- **`ga_solver/`** — a C++ / pybind11 extension implementing the genetic algorithm used to identify the low-violation working subspace `S_ε`. A brute-force baseline (`BF_benchmark.cpp`) is included for comparison.
+- **`experiments/`** — runnable Python scripts and figure-generation notebooks for the three experiment families:
   - `PO_Mixer_Benchmark.py` — SP-baseline benchmarks across mixers and depths.
   - `PO_X_Plateau.py`, `PO_new_Plateau.py` — barren-plateau diagnostics (variance scaling vs. qubit count).
   - `PO_new_ApproxRatio.py` — SC-QAOA approximation-ratio sweeps.
   - `PO_random_solution.py` — randomized admissible-portfolio reference cloud used in §08 of the paper.
   - `adam.py` — Adam optimizer wrapper with cosine-annealing schedule used across experiments.
-- **`notebooks/`** — Jupyter notebooks for figure generation and inline exploration. Outputs are stripped; rerun to regenerate.
+  - `*.ipynb` — notebooks that read the cached experiment outputs and produce the paper figures.
+  - `models/` — small pickled artefacts (`gaussian_copula*.pkl`) used by the notebooks.
 - **`scripts/`** — shell scripts that orchestrate the multi-configuration sweeps used to produce the paper's figures.
+- **`prepare_data.py`** — one-shot script that fetches the daily-price universe from Yahoo Finance and produces the two CSVs the experiments expect under `dataset/`.
 
 ## Citation
 
@@ -88,64 +90,90 @@ This compiles `genetic_solver.cpp` and exposes it as the `ga_solver` Python modu
 python -c "import cudaq, ga_solver; from Utils.qaoaCUDAQ import po_normalize; print('OK')"
 ```
 
-## Running the experiments
+## Workflow
 
-All commands below are run from the repository root.
+The pipeline runs in three ordered stages: **prepare data → run experiments → open notebooks**.
 
-### Soft-penalty baseline (§03 of the paper)
+### Stage 1 — Prepare the dataset
 
-```shell
-python experiments/PO_Mixer_Benchmark.py -Q 10 -A 3 -B 3 6 12
-```
-
-`-Q` is the qubit count, `-A` selects the asset configuration, `-B` is the list of subspace sizes to sweep. See `scripts/run_queue.sh` for the exact sweeps used to produce Fig. 1.
-
-### Barren-plateau diagnostics (§03b)
+`prepare_data.py` downloads daily prices for a configurable list of US equities from Yahoo Finance (default range 2015-04-01 to 2025-04-01) and produces the two CSV files the experiment scripts expect under `./dataset/`.
 
 ```shell
-python experiments/PO_X_Plateau.py -Q 10 -A 3
-python experiments/PO_new_Plateau.py -Q 10 -A 3
+# from the repo root
+python prepare_data.py
 ```
 
-The corresponding orchestration scripts are `scripts/run_plateau_*.sh`.
+This writes:
+- `dataset/top_50_us_stocks_returns_price.csv` — per-ticker mean return + last close + name
+- `dataset/top_50_us_stocks_data_20250526_011226_covariance.csv` — daily-return covariance matrix
 
-### Subspace-confined QAOA (§04, §07, §08)
+> **Note.** The `TICKERS` list at the top of `prepare_data.py` is a default placeholder of large-cap US equities. **Edit it to match the exact 50-ticker universe used in the paper** before running this step if you intend to reproduce the published numbers.
+
+### Stage 2 — Run the experiments
+
+All experiment commands run from the **`experiments/` directory** so the relative path `../dataset/...` resolves correctly.
 
 ```shell
-python experiments/PO_new_ApproxRatio.py -Q 10 -A 3 -K 12
+cd experiments
 ```
 
-`-K` is the working-subspace dimension. The paper reports `K ∈ {12, 24}`. See `scripts/run_approx_*.sh` for the full configuration matrix.
-
-### Random admissible reference cloud (§08)
+#### Soft-penalty baseline (§03 of the paper)
 
 ```shell
-python experiments/PO_random_solution.py -Q 10 -A 3
+python PO_Mixer_Benchmark.py -Q 10 -A 3 -B 3 6 12
 ```
 
-### Merging multi-run CSV outputs
+`-Q` = qubit count, `-A` = asset configuration, `-B` = list of subspace sizes to sweep. See `../scripts/run_queue.sh` for the exact sweep used to produce Fig. 1.
+
+#### Barren-plateau diagnostics (§03b)
 
 ```shell
-python experiments/PO_Mixer_Benchmark_Merger.py
+python PO_X_Plateau.py -Q 10 -A 3
+python PO_new_Plateau.py -Q 10 -A 3
 ```
 
-This combines per-configuration CSV outputs into a single results table consumed by the figure-generation notebooks.
+Orchestration scripts: `../scripts/run_plateau_*.sh`.
 
-## Reproducing the figures
+#### Subspace-confined QAOA (§04, §07, §08)
 
-The notebooks in `notebooks/` regenerate the paper's figures from cached CSV results.
+```shell
+python PO_new_ApproxRatio.py -Q 10 -A 3 -K 12
+```
+
+`-K` = working-subspace dimension (the paper reports `K ∈ {12, 24}`). Full configuration matrix: `../scripts/run_approx_*.sh`.
+
+#### Random admissible reference cloud (§08)
+
+```shell
+python PO_random_solution.py -Q 10 -A 3
+```
+
+#### Merging multi-run CSV outputs
+
+```shell
+python PO_Mixer_Benchmark_Merger.py
+```
+
+Combines per-configuration CSV outputs into a single results table consumed by the figure-generation notebooks.
+
+The experiment scripts write their results under `./experiments_*/` (relative to `experiments/`). Those directories are git-ignored — they are produced and consumed locally.
+
+### Stage 3 — Reproduce the figures
+
+Launch Jupyter from the **`experiments/` directory** so the notebooks share the same working directory and find `./models/`, `./experiments_*/`, and `../dataset/...`:
+
+```shell
+cd experiments  # if not already there
+jupyter notebook
+```
 
 | Figure | Notebook |
 |--------|----------|
-| Fig. 1 — SP penalty diagnostics | `notebooks/PO_Mixer_Benchmark.ipynb` |
-| Fig. 2 — Trainability | `notebooks/PO_Preserving_Mixer.ipynb` |
-| Fig. 3 — GA timing & quality  | `notebooks/PO_QAOA.ipynb` |
+| Fig. 1 — SP penalty diagnostics | `PO_Mixer_Benchmark.ipynb` |
+| Fig. 2 — Trainability | `PO_Preserving_Mixer.ipynb` |
+| Fig. 3 — GA timing & quality  | `PO_QAOA.ipynb` |
 
-Launch Jupyter from the repo root so that the `Utils.*` and `ga_solver` imports resolve:
-
-```shell
-jupyter notebook
-```
+The notebooks expect outputs from Stage 2 to already exist on disk; they do not run any experiments themselves.
 
 ## Repository layout
 
@@ -154,19 +182,18 @@ jupyter notebook
 ├── README.md
 ├── LICENSE
 ├── environment.yml
+├── prepare_data.py            # Stage 1: fetch dataset from Yahoo Finance
 ├── .gitignore
 ├── assets/
 │   └── teaser.png
-├── Utils/                  # Core QAOA / Markowitz utilities (CUDA-Q based)
-├── ga_solver/              # C++ / pybind11 GA preprocessing extension
-├── experiments/            # Runnable Python scripts
-├── notebooks/              # Figure-generation notebooks
-└── scripts/                # Shell orchestration for parameter sweeps
+├── Utils/                     # Core QAOA / Markowitz utilities (CUDA-Q based)
+├── ga_solver/                 # C++ / pybind11 GA preprocessing extension
+├── experiments/               # Stages 2 & 3: scripts + notebooks + small models
+│   ├── PO_*.py                #   experiment scripts
+│   ├── *.ipynb                #   figure-generation notebooks
+│   └── models/                #   small pickled artefacts
+└── scripts/                   # Shell orchestration for parameter sweeps
 ```
-
-## Data
-
-Asset prices and returns are loaded from Yahoo Finance via `yfinance`. The paper uses 50 US equities with prices in the range $108–$216 USD over 2015/04 – 2025/04. The exact ticker list is reproduced inside the experiment scripts; rerunning the scripts re-downloads the prices on demand.
 
 ## Acknowledgements
 
