@@ -1,147 +1,137 @@
+"""Merge per-iteration-range outputs from PO_Mixer_Benchmark.py into one
+canonical (X.csv, Preserving.csv, result.csv) per (Q, A, B) configuration.
+
+When a sweep is split across multiple GPUs (each producing
+``exp_*_it<st>-<ed>/``), this script stitches the slices back together
+under the un-suffixed directory and emits an aggregate ``result.csv`` of
+the means.
+"""
+from __future__ import annotations
+
 import argparse
 import os
-import numpy as np
-import pandas as pd
 import shutil
 
-LOOP = 100
-modes = ["X", "Preserving"]
-report_col = ["Approximate_ratio", "MaxProb_ratio", "init_1_time", "init_2_time", "optim_time", "observe_time"]
+import numpy as np
+import pandas as pd
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Experiment parameter sweep")
+ALL_MODES = ["X", "Preserving"]
+REPORT_COL = [
+    "Approximate_ratio", "MaxProb_ratio",
+    "init_1_time", "init_2_time", "optim_time", "observe_time",
+]
+DEFAULT_LOOP_COUNT = 100
 
-    # Qubits (list of ints)
-    parser.add_argument(
-        "-Q", "--qubit",
-        nargs="+", type=int, default=[5],
-        help="List of target qubits, e.g. -Q 4 5 6"
-    )
 
-    # Assets (list of ints)
-    parser.add_argument(
-        "-A", "--asset",
-        nargs="+", type=int, default=[3, 4, 5],
-        help="List of asset counts, e.g. -A 3 4 5"
-    )
-
-    # Lambda
-    parser.add_argument(
-        "-L", "--lamb",
-        type=int, default=4,
-        help="Budget Penalty (float)"
-    )
-
-    # Bases (list of ints)
-    parser.add_argument(
-        "-B", "--bases",
-        nargs="+", type=int, default=[3, 6, 12],
-        help="List of num initial bases, e.g. -B 3 6 12 25"
-    )
-
-    # Volatility
-    parser.add_argument(
-        "-q",
-        type=int, default=0,
-        help="Volatility Weight (float)"
-    )
-
-    # end iter (run from start to end-1)
-    parser.add_argument(
-        "-ed", "--end_iter",
-        type=int, default=LOOP,
-        help="Number of iterations (int)"
-    )
-
-    # modes (list of str)
-    parser.add_argument(
-        "-m", "--mode",
-        nargs="+", type=str, default=modes,
-        help="List of modes, e.g. -m X Preserving"
-    )
-
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Merge split mixer-benchmark outputs")
+    parser.add_argument("-Q", "--qubit", nargs="+", type=int, default=[5],
+                        help="Target qubit counts, e.g. -Q 4 5 6")
+    parser.add_argument("-A", "--asset", nargs="+", type=int, default=[3, 4, 5],
+                        help="Asset counts, e.g. -A 3 4 5")
+    parser.add_argument("-L", "--lamb", type=int, default=4,
+                        help="Budget penalty λ (used in directory name)")
+    parser.add_argument("-B", "--bases", nargs="+", type=int, default=[3, 6, 12],
+                        help="Subspace sizes K, e.g. -B 3 6 12 25")
+    parser.add_argument("-q", type=int, default=0,
+                        help="Volatility weight q (used in directory name)")
+    parser.add_argument("-ed", "--end_iter", type=int, default=DEFAULT_LOOP_COUNT,
+                        help="Total iterations expected per (Q, A, B) cell")
+    parser.add_argument("-m", "--mode", nargs="+", type=str, default=ALL_MODES,
+                        help=f"Modes to merge, subset of {ALL_MODES}")
     return parser.parse_args()
 
-args = parse_args()
-TARGET_QUBIT_IN = args.qubit
-N_ASSETS_IN = args.asset
-LAMB = args.lamb # Budget Penalty
-Q = args.q # Volatility Weight
-num_init_bases_in = args.bases
-LOOP = args.end_iter
-modes = args.mode
 
-def find_dir_start_with(str):
-    base_path = "./experiments"
-    ret = []
+def find_split_dirs(prefix: str, base_path: str = "./experiments") -> list[tuple[str, int, int]]:
+    """Return ``(dir_name, st, ed)`` triples for every split sub-directory under
+    ``base_path`` whose name starts with ``prefix`` and ends with ``_it<st>-<ed>``,
+    sorted by (st, ed)."""
+    out: list[tuple[str, int, int]] = []
     for dir_name in os.listdir(base_path):
-        if dir_name.startswith(str):
+        if dir_name.startswith(prefix):
             st, ed = dir_name.split("_it")[-1].split("-")
-            ret.append((dir_name, int(st), int(ed)))
-    return sorted(ret, key=lambda x: (x[1], x[2]))
+            out.append((dir_name, int(st), int(ed)))
+    return sorted(out, key=lambda x: (x[1], x[2]))
 
-for TARGET_QUBIT in TARGET_QUBIT_IN:
-    for N_ASSETS in N_ASSETS_IN:
-        for num_init_bases in num_init_bases_in:
-            dir_name = f"exp_Q{TARGET_QUBIT}_A{N_ASSETS}_L{LAMB}_q{Q}_B{num_init_bases}"
-            dir_path = f"./experiments/{dir_name}"
 
-            os.makedirs(f"{dir_path}", exist_ok=True)
-            os.makedirs(f"{dir_path}/expectations_X", exist_ok=True)
-            os.makedirs(f"{dir_path}/expectations_Preserving", exist_ok=True)
+def merge_one(target_qubit: int, n_assets: int, lamb: int, q_weight: int,
+              num_init_bases: int, loop_count: int, modes: list[str]) -> None:
+    dir_name = f"exp_Q{target_qubit}_A{n_assets}_L{lamb}_q{q_weight}_B{num_init_bases}"
+    dir_path = f"./experiments/{dir_name}"
 
-            ret = find_dir_start_with(dir_name + "_it")
-            mk = np.zeros(LOOP, dtype=bool)
-            for dirr, st, ed in ret:
-                mk[st:ed+1] = True
-            assert np.all(mk), f"Not all iterations are covered for {dir_name}, missing {np.where(mk==False)[0]}"
+    os.makedirs(dir_path, exist_ok=True)
+    for mode in ALL_MODES:
+        os.makedirs(f"{dir_path}/expectations_{mode}", exist_ok=True)
 
-            now, pdd = 0, [None, None]
-            for dirr, st, ed in ret:
-                dir_path_cp = f"./experiments/{dirr}"
-                print(dir_path_cp)
-                for m_i, mode in enumerate(modes):
-                    for i in range(now, min(ed+1, LOOP)):
-                        shutil.copyfile(f"{dir_path_cp}/expectations_{mode}/expectations_{i}.npy", f"{dir_path}/expectations_{mode}/expectations_{i}.npy")
-                    if pdd[m_i] is None:
-                        pdd[m_i] = pd.read_csv(f"{dir_path_cp}/{mode}.csv")
-                    else:
-                        pd_r = pd.read_csv(f"{dir_path_cp}/{mode}.csv")
-                        pd_r = pd_r.iloc[now-st:min(ed+1, LOOP)-st]
-                        pdd[m_i] = pd.concat([pdd[m_i], pd_r], ignore_index=True)
-                now = ed + 1
-            for m_i, mode in enumerate(modes):
-                pdd[m_i].to_csv(f"{dir_path}/{mode}.csv", index=False)
+    splits = find_split_dirs(dir_name + "_it")
+    coverage = np.zeros(loop_count, dtype=bool)
+    for _, st, ed in splits:
+        coverage[st:ed + 1] = True
+    assert np.all(coverage), (
+        f"Not all iterations are covered for {dir_name}; "
+        f"missing {np.where(~coverage)[0]}"
+    )
 
-            if "X" in modes and "Preserving" in modes:
-                df_X = pd.read_csv(f"{dir_path}/X.csv")
-                df_P = pd.read_csv(f"{dir_path}/Preserving.csv")
+    cursor = 0
+    csvs_by_mode: list[pd.DataFrame | None] = [None for _ in modes]
+    for split_dir, st, ed in splits:
+        split_path = f"./experiments/{split_dir}"
+        print(split_path)
+        end = min(ed + 1, loop_count)
+        for mode_idx, mode in enumerate(modes):
+            for i in range(cursor, end):
+                shutil.copyfile(
+                    f"{split_path}/expectations_{mode}/expectations_{i}.npy",
+                    f"{dir_path}/expectations_{mode}/expectations_{i}.npy",
+                )
+            split_csv = pd.read_csv(f"{split_path}/{mode}.csv")
+            if csvs_by_mode[mode_idx] is None:
+                csvs_by_mode[mode_idx] = split_csv
+            else:
+                csvs_by_mode[mode_idx] = pd.concat(
+                    [csvs_by_mode[mode_idx], split_csv.iloc[cursor - st:end - st]],
+                    ignore_index=True,
+                )
+        cursor = ed + 1
 
-                approx_X = df_X["Approximate_ratio"].mean()
-                approx_P = df_P["Approximate_ratio"].mean()
-                print(f"Approximate ratio for X: {approx_X:.4f}, Preserving: {approx_P:.4f}")
+    for mode_idx, mode in enumerate(modes):
+        csvs_by_mode[mode_idx].to_csv(f"{dir_path}/{mode}.csv", index=False)
 
-                maxprob_X = df_X["MaxProb_ratio"].mean()
-                maxprob_P = df_P["MaxProb_ratio"].mean()
-                print(f"MaxProb ratio for X: {maxprob_X:.4f}, Preserving: {maxprob_P:.4f}")
+    if "X" in modes and "Preserving" in modes:
+        _summarise(dir_path)
 
-                init_1_time_X = df_X["init_1_time"].mean()
-                init_2_time_X = df_X["init_2_time"].mean()
-                optim_time_X = df_X["optim_time"].mean()
-                observe_time_X = df_X["observe_time"].mean()
 
-                init_1_time_P = df_P["init_1_time"].mean()
-                init_2_time_P = df_P["init_2_time"].mean()
-                optim_time_P = df_P["optim_time"].mean()
-                observe_time_P = df_P["observe_time"].mean()
+def _summarise(dir_path: str) -> None:
+    df_X = pd.read_csv(f"{dir_path}/X.csv")
+    df_P = pd.read_csv(f"{dir_path}/Preserving.csv")
 
-                print(f"Init 1 time for X: {init_1_time_X*1000:.2f} ms, Preserving: {init_1_time_P*1000:.2f} ms")
-                print(f"Init 2 time for X: {init_2_time_X*1000:.2f} ms, Preserving: {init_2_time_P*1000:.2f} ms")
-                print(f"Optim time for X: {optim_time_X*1000:.2f} ms, Preserving: {optim_time_P*1000:.2f} ms")
-                print(f"Observe time for X: {observe_time_X*1000:.2f} ms, Preserving: {observe_time_P*1000:.2f} ms")
+    metrics_X = {col: df_X[col].mean() for col in REPORT_COL}
+    metrics_P = {col: df_P[col].mean() for col in REPORT_COL}
 
-                col_result = ["Mode"] + report_col
-                df_result = pd.DataFrame(columns=col_result)
-                df_result.loc[0] = ["X", approx_X, maxprob_X, init_1_time_X, init_2_time_X, optim_time_X, observe_time_X]
-                df_result.loc[1] = ["Preserving", approx_P, maxprob_P, init_1_time_P, init_2_time_P, optim_time_P, observe_time_P]
-                df_result.to_csv(f"{dir_path}/result.csv", index=False)
+    print(f"Approximate ratio  X: {metrics_X['Approximate_ratio']:.4f}, "
+          f"Preserving: {metrics_P['Approximate_ratio']:.4f}")
+    print(f"MaxProb ratio      X: {metrics_X['MaxProb_ratio']:.4f}, "
+          f"Preserving: {metrics_P['MaxProb_ratio']:.4f}")
+    for stage in ("init_1_time", "init_2_time", "optim_time", "observe_time"):
+        print(f"{stage:14s}     X: {metrics_X[stage]*1000:.2f} ms, "
+              f"Preserving: {metrics_P[stage]*1000:.2f} ms")
+
+    df_result = pd.DataFrame(columns=["Mode"] + REPORT_COL)
+    df_result.loc[0] = ["X"] + [metrics_X[c] for c in REPORT_COL]
+    df_result.loc[1] = ["Preserving"] + [metrics_P[c] for c in REPORT_COL]
+    df_result.to_csv(f"{dir_path}/result.csv", index=False)
+
+
+def main() -> None:
+    args = parse_args()
+    for target_qubit in args.qubit:
+        for n_assets in args.asset:
+            for num_init_bases in args.bases:
+                merge_one(
+                    target_qubit, n_assets, args.lamb, args.q,
+                    num_init_bases, args.end_iter, args.mode,
+                )
+
+
+if __name__ == "__main__":
+    main()
