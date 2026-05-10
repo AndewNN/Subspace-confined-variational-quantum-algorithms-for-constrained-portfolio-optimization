@@ -17,17 +17,17 @@ We replace the standard QAOA penalty term `λ · H_penalty` with a *preserving m
 
 The repository contains:
 
-- **`Utils/`** — core QAOA / Markowitz utilities (`qaoaCUDAQ.py`), graph construction, and solver helpers built on top of [CUDA-Q](https://github.com/NVIDIA/cuda-quantum).
+- **`Utils/`** — core QAOA / Markowitz utilities (`qaoaCUDAQ.py`), graph construction, and helper functions built on top of [CUDA-Q](https://github.com/NVIDIA/cuda-quantum).
 - **`ga_solver/`** — a C++ / pybind11 extension implementing the genetic algorithm used to identify the low-violation working subspace `S_ε`. A brute-force baseline (`BF_benchmark.cpp`) is included for comparison.
-- **`experiments/`** — runnable Python scripts and figure-generation notebooks for the three experiment families:
+- **`experiments/`** — runnable Python scripts for the three experiment families plus figure-generation scripts:
   - `PO_Mixer_Benchmark.py` — SP-baseline benchmarks across mixers and depths.
   - `PO_X_Plateau.py`, `PO_new_Plateau.py` — barren-plateau diagnostics (variance scaling vs. qubit count).
   - `PO_new_ApproxRatio.py` — SC-QAOA approximation-ratio sweeps.
   - `PO_random_solution.py` — randomized admissible-portfolio reference cloud used in §08 of the paper.
   - `adam.py` — Adam optimizer wrapper with cosine-annealing schedule used across experiments.
-  - `*.ipynb` — notebooks that read the cached experiment outputs and produce the paper figures.
-  - `models/` — small pickled artefacts (`gaussian_copula*.pkl`) used by the notebooks.
-- **`scripts/`** — shell scripts that orchestrate the multi-configuration sweeps used to produce the paper's figures.
+  - `make_fig2_trainability.py`, `make_fig3_ga_quality.py` — read the cached experiment outputs and produce the paper figures.
+  - `models/` — small pickled artefacts (`gaussian_copula*.pkl`) used by the figure-generation scripts.
+- **`scripts/`** — three parameterized shell scripts that orchestrate the multi-configuration sweeps used to produce the paper's figures.
 - **`prepare_data.py`** — one-shot script that fetches the daily-price universe from Yahoo Finance and produces the two CSVs the experiments expect under `dataset/`.
 
 ## Citation
@@ -123,7 +123,14 @@ cd experiments
 python PO_Mixer_Benchmark.py -Q 10 -A 3 -B 3 6 12
 ```
 
-`-Q` = qubit count, `-A` = asset configuration, `-B` = list of subspace sizes to sweep. See `../scripts/run_queue.sh` for the exact sweep used to produce Fig. 1.
+`-Q` = qubit count, `-A` = asset configuration, `-B` = list of subspace sizes to sweep. The orchestration script `../scripts/run_mixer_benchmark.sh` runs the exact sweeps used to produce Fig. 1:
+
+```shell
+bash ../scripts/run_mixer_benchmark.sh full           # full sweep
+bash ../scripts/run_mixer_benchmark.sh mini           # quick smoke test
+bash ../scripts/run_mixer_benchmark.sh split 0        # one slice on GPU 0
+bash ../scripts/run_mixer_benchmark.sh merge 4 3 3    # 4-way Preserving + merger
+```
 
 #### Barren-plateau diagnostics (§03b)
 
@@ -132,7 +139,12 @@ python PO_X_Plateau.py -Q 10 -A 3
 python PO_new_Plateau.py -Q 10 -A 3
 ```
 
-Orchestration scripts: `../scripts/run_plateau_*.sh`.
+The orchestration script `../scripts/run_plateau.sh` runs the full plateau sweep:
+
+```shell
+bash ../scripts/run_plateau.sh x_mixer 0 0.001 1      # GPU 0, λ=0.001, q=1
+bash ../scripts/run_plateau.sh preserving             # Preserving-mixer plateau sweep
+```
 
 #### Subspace-confined QAOA (§04, §07, §08)
 
@@ -140,7 +152,12 @@ Orchestration scripts: `../scripts/run_plateau_*.sh`.
 python PO_new_ApproxRatio.py -Q 10 -A 3 -K 12
 ```
 
-`-K` = working-subspace dimension (the paper reports `K ∈ {12, 24}`). Full configuration matrix: `../scripts/run_approx_*.sh`.
+`-K` = working-subspace dimension (the paper reports `K ∈ {12, 24}`). The orchestration script `../scripts/run_approx.sh` provides the canonical presets:
+
+```shell
+bash ../scripts/run_approx.sh preserving_K24          # main SC-QAOA config (Fig 5)
+bash ../scripts/run_approx.sh x_baseline              # SP-baseline comparison (Fig 5)
+```
 
 #### Random admissible reference cloud (§08)
 
@@ -154,26 +171,26 @@ python PO_random_solution.py -Q 10 -A 3
 python PO_Mixer_Benchmark_Merger.py
 ```
 
-Combines per-configuration CSV outputs into a single results table consumed by the figure-generation notebooks.
+Combines per-configuration CSV outputs into a single results table consumed by the figure-generation scripts.
 
 The experiment scripts write their results under `./experiments_*/` (relative to `experiments/`). Those directories are git-ignored — they are produced and consumed locally.
 
 ### Stage 3 — Reproduce the figures
 
-Launch Jupyter from the **`experiments/` directory** so the notebooks share the same working directory and find `./models/`, `./experiments_*/`, and `../dataset/...`:
+Run the figure-generation scripts from the **`experiments/` directory** so the relative paths `./models/`, `./experiments_*/`, and `../dataset/...` resolve correctly:
 
 ```shell
 cd experiments  # if not already there
-jupyter notebook
+python make_fig2_trainability.py
+python make_fig3_ga_quality.py
 ```
 
-| Figure | Notebook |
-|--------|----------|
-| Fig. 1 — SP penalty diagnostics | `PO_Mixer_Benchmark.ipynb` |
-| Fig. 2 — Trainability | `PO_Preserving_Mixer.ipynb` |
-| Fig. 3 — GA timing & quality  | `PO_QAOA.ipynb` |
+| Figure | Script |
+|--------|--------|
+| Fig. 2 — Trainability | `make_fig2_trainability.py` |
+| Fig. 3 — GA timing & quality | `make_fig3_ga_quality.py` |
 
-The notebooks expect outputs from Stage 2 to already exist on disk; they do not run any experiments themselves.
+The scripts retain their original cell structure as `# %% [code cell N]` markers, so they can also be opened in VS Code's Interactive Window or Spyder for cell-by-cell exploration. They expect outputs from Stage 2 to already exist on disk; they do not run any experiments themselves.
 
 ## Repository layout
 
@@ -182,17 +199,21 @@ The notebooks expect outputs from Stage 2 to already exist on disk; they do not 
 ├── README.md
 ├── LICENSE
 ├── environment.yml
-├── prepare_data.py            # Stage 1: fetch dataset from Yahoo Finance
+├── prepare_data.py             # Stage 1: fetch dataset from Yahoo Finance
 ├── .gitignore
 ├── assets/
 │   └── teaser.png
-├── Utils/                     # Core QAOA / Markowitz utilities (CUDA-Q based)
-├── ga_solver/                 # C++ / pybind11 GA preprocessing extension
-├── experiments/               # Stages 2 & 3: scripts + notebooks + small models
-│   ├── PO_*.py                #   experiment scripts
-│   ├── *.ipynb                #   figure-generation notebooks
-│   └── models/                #   small pickled artefacts
-└── scripts/                   # Shell orchestration for parameter sweeps
+├── Utils/                      # Core QAOA / Markowitz utilities (CUDA-Q based)
+├── ga_solver/                  # C++ / pybind11 GA preprocessing extension
+├── experiments/                # Stages 2 & 3: experiment + figure-generation scripts
+│   ├── PO_*.py                 #   experiment scripts
+│   ├── make_fig2_trainability.py    # Fig. 2 generator
+│   ├── make_fig3_ga_quality.py      # Fig. 3 generator
+│   └── models/                 #   small pickled artefacts
+└── scripts/                    # Shell orchestration for parameter sweeps
+    ├── run_mixer_benchmark.sh  #   §03 sweeps (PO_Mixer_Benchmark)
+    ├── run_plateau.sh          #   §03b plateau diagnostics
+    └── run_approx.sh           #   §07/§08 SC-QAOA approximation-ratio sweeps
 ```
 
 ## Acknowledgements
