@@ -1,38 +1,59 @@
-import numpy as np
-import pandas as pd
-import cudaq
-import sys
-import os
-import torch
-from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts, ReduceLROnPlateau, ExponentialLR, CyclicLR, SequentialLR
-import time
-from tqdm import tqdm
-import shutil
+"""Random admissible-portfolio reference cloud (§08 of the paper).
+
+For each (asset count, experiment) pair, picks a tickers subset and
+samples random parameter points to populate the cyan reference cloud
+shown on the risk-return plane in Fig. 5. Shares the dataset-loading
+and Hamiltonian-construction scaffolding with PO_new_ApproxRatio.
+
+Boost-factor reference (X mixer, A=6):
+    L=0.5      b_X = 50
+    L=0.05     b_X = 250
+    L=0.005    b_X = 6875
+    L=0.0005   b_X = 17500
+    L=0.00005  b_X = 23750
+    L=0.000005 b_X = 36875
+"""
+from __future__ import annotations
+
 import argparse
 import faulthandler
-import ga_solver
+import os
+import time
 from math import sqrt
+
+import ga_solver
+import numpy as np
+import pandas as pd
+import torch
+from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
+
+import cudaq
+
+import _paths  # noqa: F401  (puts project root on sys.path for ``from Utils.…``)
+from _data import load_universe
+from Utils.qaoaCUDAQ import (
+    all_state_to_return,
+    basis_T_to_pauli_parallel,
+    find_budget,
+    get_init_states,
+    get_optimizer,
+    kernel_flipped,
+    kernel_qaoa_Preserved,
+    kernel_qaoa_X,
+    po_normalize,
+    process_ansatz_values,
+    qubo_to_ising,
+    ret_cov_to_QUBO,
+    reversed_str_bases_to_init_state,
+)
+
 faulthandler.enable()
-sys.path.append(os.path.abspath(".."))
-from Utils.qaoaCUDAQ import po_normalize, ret_cov_to_QUBO, qubo_to_ising, process_ansatz_values, kernel_qaoa_X, find_budget, kernel_flipped,\
-    kernel_qaoa_Preserved, all_state_to_return, get_init_states, basis_T_to_pauli_parallel, basis_T_to_pauli, reversed_str_bases_to_init_state, get_optimizer
-
-'''
-X A6
-
-L0.5 b_X: 50
-L0.05 b_X: 250
-L0.005 b_X: 6875
-L0.0005 b_X: 17500
-L0.00005 b_X: 23750
-L0.000005 b_X: 36875    
-'''
 
 if __name__ == "__main__":
     cudaq.set_target("nvidia")
     pd.set_option('display.width', 1000)
-    # np.random.seed(109)
     # rand_state = np.random.get_state()
 
     # Assume that already set CUDA_VISIBLE_DEVICES
@@ -53,15 +74,7 @@ if __name__ == "__main__":
     F_TOL = 1e-4
     is_GA = False
 
-    # os.system("taskset -p 0xfffff %d" % os.getpid())
-
-    def file_copy(src, dst):
-        try:
-            shutil.copyfile(src, dst)
-        except shutil.SameFileError:
-            pass
-
-    def parse_argss():
+    def parse_args():
         parser = argparse.ArgumentParser(description="Experiment parameter sweep")
 
         # number of Experiments (int)
@@ -77,7 +90,6 @@ if __name__ == "__main__":
             type=int, default=10,
             help="Number of Points (int)"
         )
-
 
         # idx of Starting Experiment (int)
         parser.add_argument(
@@ -242,7 +254,7 @@ if __name__ == "__main__":
 
         return parser.parse_args()
 
-    args = parse_argss()
+    args = parse_args()
 
     # HYPER PARAMETERS
     TARGET_QUBIT_IN = args.qubit
@@ -290,26 +302,11 @@ if __name__ == "__main__":
         eps = eps * len(TARGET_ASSET)
     eps = np.array(eps)
 
-    # a = cudaq.spin.x(0) * cudaq.spin.x(1) * cudaq.spin.z(2) * cudaq.spin.z(3) * cudaq.spin.y(4)
-    # b = cudaq.spin.y(0) * cudaq.spin.x(1) * cudaq.spin.z(2) * cudaq.spin.z(3) * cudaq.spin.y(4)
     # s_a, s_b = a.get_pauli_word(), b.get_pauli_word()
     # c_a, c_b = a.evaluate_coefficient().real, b.evaluate_coefficient().real
-    # print(sys.getsizeof(s_a), sys.getsizeof(s_b))
-    # print(sys.getsizeof(c_a), sys.getsizeof(c_b))
-    # exit(0)
 
-    # Dataset
-    data_cov_pd = pd.read_csv("../dataset/top_50_us_stocks_data_20250526_011226_covariance.csv")
-    data_ret_p_pd = pd.read_csv("../dataset/top_50_us_stocks_returns_price.csv")
-    # print(np.sort(data_ret_p_pd["Price"]))
-    # exit(0)
-
-    data_ret_p_pd = data_ret_p_pd[(data_ret_p_pd["Price"] > min_P) & (data_ret_p_pd["Price"] < max_P)]
-
-    data_cov_pd = data_cov_pd.loc[data_cov_pd["Ticker"].isin(data_ret_p_pd["Ticker"])].reset_index(drop=True)
-    data_cov_pd = data_cov_pd[["Ticker"] + data_cov_pd["Ticker"].tolist()]
-    # print(data_cov_pd.shape, data_ret_p_pd.shape) 
-    # exit(0)
+    # Dataset (filtered to the [min_P, max_P] price band)
+    data_ret_p_pd, data_cov_pd = load_universe(min_P, max_P)
 
     # experiments_approx_Q3/exp_p5_L0.001_q1\
     #                                        |- report_X_boost_1.csv
@@ -332,22 +329,15 @@ if __name__ == "__main__":
         os.makedirs(dir_path, exist_ok=True)
 
     print(f"Experiments: {E}, Qubits/Asset: {TARGET_QUBIT_IN}, Assets: {TARGET_ASSET}, epsilon: {eps.tolist()}, Lambda: {LAMB}, q: {Q}, Layers: {LAYER}, mode: {mode}{f', num_init_bases: {num_init_bases}' if mode == 'Preserving' else ''}, GA: {is_GA}, boost: {hamiltonian_X_boost if mode == 'X' else hamiltonian_P_boost}")
-    # if __name__ == "__main__":
-        # from multiprocessing import freeze_support
-        # freeze_support()
     # if is_pbar:
-    #     pbar_A = tqdm(TARGET_ASSET)
     # # for i, N_ASSETS in enumerate(pbar_A):
-    # for i, N_ASSETS in (enumerate(TARGET_ASSET) if not is_pbar else enumerate(pbar_A)):
     pbar_A = tqdm(TARGET_ASSET, disable=not is_pbar)
     for idx_asset, N_ASSETS in enumerate(pbar_A):
         if is_pbar:
             pbar_A.set_description(f"Assets {N_ASSETS}")
-            # pbar_exp = tqdm(range(E_st, E), leave=False)
         # for e in (range(E_st, E) if not is_pbar else pbar_exp):
         pbar_exp = tqdm(range(E_st, E), leave=False, disable=not is_pbar)
         for e in pbar_exp:
-        # for e in range(E):
             df_now = pd.read_csv(f"{dir_path}/{report_name}") if os.path.exists(f"{dir_path}/{report_name}") else None
             if df_now is not None:
                 if not OVERWRITE and df_now[(df_now["Assets"] == N_ASSETS) & (df_now["Exp"] == e)].shape[0] >= num_points:
@@ -362,29 +352,15 @@ if __name__ == "__main__":
             state = np.random.get_state()
             # asset_idx = np.random.choice(data_cov_pd.shape[0], max(TARGET_ASSET), replace=False)
             asset_idx = np.random.choice(data_cov_pd.shape[0], N_ASSETS, replace=DUPLICATE_ASSET)
-            # print(asset_idx)
             # asset_idx = np.array([0, 18, 27, 32, 41])
-            # data_cov = data_cov_pd.drop("Ticker", axis=1)
             data_cov = data_cov_pd.drop("Ticker", axis=1).to_numpy()[asset_idx, :][:, asset_idx]
             stock_names = data_ret_p_pd["Company_Name"].to_numpy()[asset_idx]
-            # print("Selected Stocks: ", stock_names)
             data_ret_p = data_ret_p_pd.drop("Ticker", axis=1)
-            # print(data_ret_p.index[asset_idx].to_numpy())
             asset_idx_raw = data_ret_p.index[asset_idx].to_numpy()
             data_ret_p = data_ret_p.drop("Company_Name", axis=1).to_numpy()[asset_idx, :]
 
-            
-
             data_ret = data_ret_p[:, 0]
             data_p = data_ret_p[:, 1]
-
-            # print(data_cov)
-            # print(data_p.tolist())
-            # print(data_ret.tolist())
-            # print(data_cov.tolist())
-            # print(stock_names)
-            # print(asset_idx)
-            # break
 
             if os.path.exists(f"{dir_path}/{expect_name}"):
                 curr_expect = np.load(f"{dir_path}/{expect_name}")
@@ -395,28 +371,12 @@ if __name__ == "__main__":
             curr_expect[f'A{N_ASSETS}_E{e}_ret'] = data_ret
             curr_expect[f'A{N_ASSETS}_E{e}_cov'] = data_cov
             curr_expect[f'A{N_ASSETS}_E{e}_idx'] = asset_idx_raw
-            # np.savez_compressed(f"{dir_path}/{expect_name}", **curr_expect)
-            # continue
-
-            # print(data_cov.shape)
-
-            # np.random.set_state(state)
-            # selected_price = np.random.uniform(125, 250, N_ASSETS)
-            # price_factor = selected_price / data_p
-            # data_p = selected_price
 
             np.random.set_state(state)
             weighted = np.random.uniform(0, 1)
             B_mi, B_ma = find_budget(TARGET_QUBIT_IN * N_ASSETS, data_p, min_P, max_P, min_mix_mode=True)
             B = B_mi * weighted + B_ma * (1 - weighted)
 
-
-            # print(data_ret)
-            # print(B)
-            # print(data_p)
-            # break
-            # print("\n", data_p)
-            # break
             mean12_eps_GA, mean24_eps_GA = 0, 0
             if is_GA:
                 mutation_rate = 1.5 / (N_ASSETS * TARGET_QUBIT_IN)
@@ -446,13 +406,8 @@ if __name__ == "__main__":
                             str_a = str(int(chrom[aa * TARGET_QUBIT_IN + c])) + str_a
                         str_b += str_a
                     feasible_reversed_basis_appr.append(str_b)
-                    # print(np.abs(B-top_inv[i].total_cost)/B)
 
                     ## -------------
-                    # st_BF = time.perf_counter()
-                    # top_inv_gt = ga.get_top_n_brute_force_individuals(num_init_bases, False)
-                    # et_BF = time.perf_counter()
-                    # time_BF = et_BF - st_BF
 
                     col_GA = ["Assets", "GA_time_ms", "BF_time_ms", "mean12_eps_GA", "mean24_eps_GA", "mean12_eps_BF", "mean24_eps_BF"]
 
@@ -461,30 +416,20 @@ if __name__ == "__main__":
                     list_chrom_ga = []
                     for i in range(12):
                         budd = top_inv[i].total_cost
-                        # budd_gt = top_inv_gt[i].total_cost
                         all_diff_ga += np.abs(budd - B) / B
                         list_diff_ga.append(np.abs(budd - B) / B)
                         list_chrom_ga.append(top_inv[i].chromosome)
-                        # all_diff_bf += np.abs(budd_gt - B) / B
                     mean12_eps_GA = all_diff_ga / 12
                     mean12_eps_BF = all_diff_bf / 12
 
                     if num_init_bases >= 24:
                         for i in range(12, 24):
                             budd = top_inv[i].total_cost
-                            # budd_gt = top_inv_gt[i].total_cost
                             all_diff_ga += np.abs(budd - B) / B
                             list_diff_ga.append(np.abs(budd - B) / B)
                             list_chrom_ga.append(top_inv[i].chromosome)
-                            # all_diff_bf += np.abs(budd_gt - B) / B
                     mean24_eps_GA = all_diff_ga / 24
                     mean24_eps_BF = all_diff_bf / 24
-                # print(mean12_eps_GA, mean24_eps_GA)
-
-
-
-
-
 
             P = data_p[:N_ASSETS]
             ret = data_ret[:N_ASSETS]
@@ -498,7 +443,6 @@ if __name__ == "__main__":
                 QU_lamb = ret_cov_to_QUBO(np.zeros_like(ret_bb), np.zeros_like(cov_bb), P_bb, lamb, 0.0)
             if not DEBUG_GA:
                 TARGET_QUBIT = n_qubit
-                # print(f"Assets: {N_ASSETS}, Qubits: {n_qubit}")
 
                 # QUBOs of MAX PROBLEM
                 QU = ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q)
@@ -513,26 +457,19 @@ if __name__ == "__main__":
                 H_return = -qubo_to_ising(QU_return, 0.0).canonicalize() * hamiltonian_boost
                 H_risk = -qubo_to_ising(QU_risk, 0.0).canonicalize() * hamiltonian_boost
 
-
             # state_return = all_state_to_return(n_qubit, lamb, QU)
             if DEBUG_GA ^ (not DEBUG_BF):
                 st = time.perf_counter()
                 state_penalty = -all_state_to_return(n_qubit, lamb, QU_lamb) # lamb * |P^t x -1|^2
                 time_BF = time.perf_counter() - st
 
-            # print("Time GA penalty (s):", time_GA)
-            # print("Time BF penalty (s):", time_BF)
             if DEBUG_BF:
                 state_penalty_s = np.sort(state_penalty)
                 mean12_eps_BF = np.sqrt(state_penalty_s[:12] / lamb).mean()
                 mean24_eps_BF = np.sqrt(state_penalty_s[:24] / lamb).mean()
-            # print(state_penalty_s[:24])
             # for i in range(24):
             #     gaa = list_diff_ga[i]
             #     bff = np.sqrt(state_penalty_s[i] / lamb)
-            #     print(gaa, bff, ("****************" if bff - gaa > 1e-8 else ""))
-            #     print(list_chrom_ga[i])
-            #     print()
             
             df_speed = (pd.read_csv("./speed.csv") if os.path.exists("./speed.csv") else pd.DataFrame(columns=["Assets", "GA_time_ms", "BF_time_ms", "mean12_eps_GA", "mean24_eps_GA", "mean12_eps_BF", "mean24_eps_BF"]))
             new_row_speed = {
@@ -555,22 +492,7 @@ if __name__ == "__main__":
             state_eval = all_state_to_return(n_qubit, 0.0, QU_eval)
 
             # state_optim = -all_state_to_return(n_qubit, *((lamb, QU) if mode == "X" else (0.0, QU_eval)))
-            # idx_bestt = np.argmin(state_eval)
-            # best_vall = state_optim[idx_bestt]
-            # print(state_optim.min(), state_optim.max())
             # # print(best_vall)
-            # continue
-
-            # np.save(f"./debug/QU_L1/qubo_A{N_ASSETS}_E{e}.npy", QU_lamb)
-            # continue
-            # state_budgetD = np.sqrt(state_penalty/lamb)
-            # print(np.sort(state_budgetD)[:12])
-            # break
-
-
-            # np.save(f"./debug/state_return_{file_postfix}_p{LAYER}_L{f_LAMB}_q{f_Q}_A{N_ASSETS}_Q{TARGET_QUBIT}.npy", np.array(state_return))
-            # print("saved")
-            # break
 
             # |P^t x -1| <= eps
             # lamb (P^t x -1)^2 <= lamb * eps^2
@@ -578,19 +500,7 @@ if __name__ == "__main__":
             idx_feasible = np.where(np.abs(state_penalty) <= eps_t)
 
             # direct compute
-            # state_penalty_eps = np.sqrt(state_penalty / lamb)
-            # idx_feasible_debug = np.where(state_penalty_eps <= eps[idx_asset])
-            # print("equality:", (sorted(idx_feasible[0]) == sorted(idx_feasible_debug[0]))) 
-            # break
             
-            # mi_r, ma_r = state_eval[idx_feasible].min(), state_eval[idx_feasible].max()
-            # print(len(idx_feasible))
-            # idx_dbg = np.argsort(state_penalty)
-            # print(np.sqrt(state_penalty[idx_dbg[[1]]] / lamb))
-            # print("mi", mi_r, ma_r)
-            # break
-
-
             init_1_time = time.time() - st
 
             if is_pbar:
@@ -606,47 +516,28 @@ if __name__ == "__main__":
                 ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use)
             else:
                 # init_state = get_init_states(state_return, num_init_bases, n_qubit)
-                # idx_eiei = np.argsort(state_penalty)[num_init_bases-1]
                 if is_GA:
                     init_state = feasible_reversed_basis_appr.copy()
                 else:
                     if BEST_BASES:
-                        # print(-state_eval)
                         init_state = get_init_states(-state_eval, num_init_bases, n_qubit, idx_feasible[0])
                     else:
                         init_state = get_init_states(state_penalty, num_init_bases, n_qubit)
                     
-                # print(sorted(feasible_reversed_basis_appr))
-                # print(sorted(get_init_states(state_penalty, num_init_bases, n_qubit)))
-                # break
-
                 # # print(init_state[num_init_bases-1], P_bb)
                 # uuu = np.array([int(e) for e in init_state[num_init_bases-1]])
-                # print(-1 * (uuu @ P_bb - 1))
                 # idxx = np.argsort(state_penalty)
-                # print(np.sqrt(state_penalty[idxx[[num_init_bases-1]]] / lamb))
-                # continue
                 n_bases = len(init_state)
-                # print("n_bases:", n_bases)
                 T = np.zeros((n_bases, n_bases), dtype=np.float32)
                 T[:-1, 1:] += np.eye(n_bases - 1, dtype=np.float32)
                 T[1:, :-1] += np.eye(n_bases - 1, dtype=np.float32)
                 T[0, -1] = T[-1, 0] = 1.0
-                # print(T)
                 st_pauli = time.time()
                 # mixer_s, mixer_c = basis_T_to_pauli(init_state, T, n_qubit)
                 mixer_s, mixer_c = basis_T_to_pauli_parallel(init_state, T, n_qubit)
-                # print("num pauli string (1 layer):", len(mixer_s))
-                # print("time:", time.time() - st_pauli)
-                # assert False
                 # mixer_s = mixer_s[:250000]
                 # mixer_c = mixer_c[:250000]
-                # break
-                # print(init_state[0])
-                # print(feasible_basis_appr[0])
-                # break
                 init_bases = reversed_str_bases_to_init_state(init_state, n_qubit)
-                # print(init_bases)
 
                 ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use, mixer_s, mixer_c, init_bases)
 
@@ -661,24 +552,20 @@ if __name__ == "__main__":
             # if not is_torch_optim:
             #     optimizer, optimizer_name, FIND_GRAD = get_optimizer(idx)
             #     optimizer.max_iterations = 300
-                # print(f"\noptim iter: {optimizer.max_iterations}\noptim eps: {optimizer.eps}")
             
             for idx_point in range(num_points):
                 np.random.seed(4001 + 4099 * e + 4999 * N_ASSETS + 967 * idx_point)
                 points = np.random.uniform(-1, 1, (parameter_count))
                 points[::2] *= mm_i
                 points[1::2] *= np.pi
-                # print(f"Initial Parameters: {points.tolist()}")
 
                 # result = cudaq.get_state(kernel_qaoa_use, points, *ansatz_fixed_param)
                 # prob = np.abs(result)**2
-                # print(np.sort(prob))
 
                 init_2_time = time.time() - st
 
                 if is_pbar:
                     pbar_exp.set_description("optim  ")
-                # print("start optimization")
                 st = time.time()
                 num_iter = 0
                 last_f = None
@@ -691,9 +578,7 @@ if __name__ == "__main__":
                     curr_expect = {}
                 curr_expect = dict(curr_expect)
                 curr_expect[f'A{N_ASSETS}_E{e}'] = np.array(expectations)
-                # print("optimal parameters:", optimal_parameters.tolist())
                 curr_expect[f'A{N_ASSETS}_E{e}_params'] = np.array(optimal_parameters)
-                # np.savez_compressed(f"{dir_path}/{expect_name}", **curr_expect)
                 optim_time = time.time() - st
 
                 if is_pbar:
@@ -705,17 +590,10 @@ if __name__ == "__main__":
 
                 result_r = cudaq.get_state(kernel_flipped, result, TARGET_QUBIT)
                 prob = np.abs(result_r)**2
-                # print(-np.sort(-prob)[:5])
 
-                # mi_r, ma_r = state_eval.min(), state_eval.max()
-                # print(f"\n\nhere\n{idx_feasible[0].shape} {eps}\n\n")
                 mi_r, ma_r = state_eval[idx_feasible].min(), state_eval[idx_feasible].max()
-                # print(optimal_expectation)
                 optimal_expectation = (prob * (state_eval)).sum()
-                # print(optimal_expectation)
-                # print(np.sort(prob))
 
-                # print(idx_feasible[0].shape)
                 if len(idx_feasible[0]) >= 2:
                     approx_ratio = (optimal_expectation - mi_r) / (ma_r - mi_r)
                     maxprob_ratio = (state_eval[int(idx_best, 2)] - mi_r) / (ma_r - mi_r)
@@ -733,7 +611,6 @@ if __name__ == "__main__":
                 # remove row such that Assets and Exp match
                 df_now = df_now[~((df_now["Assets"] == N_ASSETS) & (df_now["Exp"] == e) & (df_now["Point"] == idx_point))]
                 
-
                 df_now.loc[-1] = [N_ASSETS, e, idx_point, n_qubit, approx_ratio, return_final, risk_final, budget_violation, B, maxprob_ratio, init_1_time, init_2_time, optim_time, num_iter, observe_time]
                 df_now.sort_values(by=["Assets", "Exp"], inplace=True)
                 df_now.reset_index(drop=True, inplace=True)
