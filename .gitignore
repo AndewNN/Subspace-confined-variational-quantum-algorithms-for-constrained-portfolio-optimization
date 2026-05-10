@@ -1,0 +1,33 @@
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+*.so
+build/
+dist/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local environment
+.env
+venv/
+env/
+.conda/
+
+# Experiment artefacts
+output/
+output_PO/
+results/
+experiments_*/
+models/
+dataset/
+*.npy
+*.cbin
+*.zip

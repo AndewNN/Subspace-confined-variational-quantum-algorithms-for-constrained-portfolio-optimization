@@ -1,0 +1,23 @@
+name: scqaoa
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - tqdm
+  - joblib
+  - jupyter
+  - notebook
+  - pybind11
+  - psutil
+  - pip:
+      - cuda-quantum-cu12
+      - torch
+      - yfinance
