@@ -1,11 +1,9 @@
 """Generate Fig. 2 (trainability) from cached experiment outputs.
 
-Run from the experiments/ directory so the relative paths
-./models/, ./output_PO_*, and ../dataset/ resolve identically
-to the original notebook.
+Run from the experiments/ directory so relative paths to ../dataset/,
+./models/, and ./output_PO_* resolve correctly.
 """
 
-# %% [code cell 1]
 import numpy as np
 import pandas as pd
 import cudaq
@@ -20,10 +18,11 @@ import plotly.express as px
 from tqdm import tqdm
 import sys
 import os
+
+import _paths  # noqa: F401
 from sklearn.decomposition import PCA
 import torch
 
-sys.path.append(os.path.abspath(".."))
 from Utils.qaoaCUDAQ import po_normalize, ret_cov_to_QUBO, qubo_to_ising, process_ansatz_values, state_to_return, pauli_to_int, int_to_pauli, basis_T_to_pauli,\
     reversed_str_bases_to_init_state, kernel_qaoa_Preserved, kernel_flipped, get_optimizer, optimizer_names, all_state_to_return, get_init_states
 
@@ -33,13 +32,10 @@ cudaq.set_target("nvidia")
 
 np.random.seed(42)
 
-# %% [markdown]
 # !! warning: Representing Pauli words using INTEGER !!
 
-# %% [code cell 2]
 print(4**30 // 10**18)
 
-# %% [code cell 3]
 import seaborn as sns
 from copulas.multivariate import GaussianMultivariate
 import joblib
@@ -53,32 +49,18 @@ plt.show()
 print(data["Price"].min(), data["Price"].max())
 print(data["Average_Return"].min(), data["Average_Return"].max())
 
-# %% [code cell 4]
-# X = data[['Price', 'Average_Return']]
-# GM = GaussianMultivariate()
-# GM.fit(X)
-# joblib.dump(GM, './models/gaussian_copula.pkl')
-
-# %% [code cell 5]
 covv = np.array(data_cov.iloc[:, 1:])
-# print(covv[:4, :4])
 print(covv.min(), covv.max())
 
-# covv = np.roll(covv, np.arange(covv.shape[0]), axis=1)
 for i in range(covv.shape[0]):
     covv[i] = np.roll(covv[i], -i)
-# print(covv[:4, :4])
 
 GM2 = GaussianMultivariate()
 print(data_cov)
 print(covv[:4, :4])
-# GM2.fit(covv)
-# joblib.dump(GM2, './models/gaussian_copula_covariance.pkl')
 
-# %% [code cell 6]
 GM2_load = joblib.load('./models/gaussian_copula_covariance.pkl')
 samples_cov = GM2_load.sample(50)
-# print(samples_cov)
 samples_cov = np.array(samples_cov)
 samples_cov = np.abs(samples_cov)
 for i in range(samples_cov.shape[0]):
@@ -88,20 +70,16 @@ print(covv.min(), covv.max())
 print(samples_cov.min(), samples_cov.max())
 print(samples_cov[:4, :4])
 
-# %% [code cell 7]
 GM_loaded = joblib.load('./models/gaussian_copula.pkl')
 samples = GM_loaded.sample(50)
 print(samples["Average_Return"].min(), samples["Average_Return"].max())
 sns.jointplot(data=samples, x='Price', y='Average_Return', kind='reg')
 plt.show()
 
-# %% [markdown]
 # # HAMILTONIAN BY CUDAQ
 
-# %% [markdown]
 # ### by random values
 
-# %% [code cell 8]
 B = 100
 ret = np.array([1.0, 1.25, 1.5])
 cov = np.random.rand(3, 3)
@@ -120,7 +98,6 @@ print("n_max:", n_max)
 QU = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q)
 H = qubo_to_ising(QU, lamb)
 
-# %% [code cell 9]
 print("Hamiltonian:", H)
 idx_1, coeff_1, idx_2_a, idx_2_b, coeff_2 = process_ansatz_values(H)
 
@@ -130,10 +107,8 @@ print(idx_2_a)
 print(idx_2_b)
 print(coeff_2)
 
-# %% [markdown]
 # ### by stock values
 
-# %% [code cell 10]
 data_cov = pd.read_csv("../dataset/top_50_us_stocks_data_20250526_011226_covariance.csv")
 data_ret_p = pd.read_csv("../dataset/top_50_us_stocks_returns_price.csv")
 
@@ -168,12 +143,10 @@ print(data_ret.round(5))
 print(data_p.round(2))
 print(stock_names)
 
-# %% [code cell 11]
 a = 5
 a += spin.z(0)
 print(a.canonicalize())
 
-# %% [code cell 12]
 P_bb, ret_bb, cov_bb, n_qubit, n_max, C = po_normalize(B, data_p, data_ret, data_cov)
 
 print(cov_bb)
@@ -182,10 +155,8 @@ print("n_qubit:", n_qubit)
 QU = ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q)
 H = -qubo_to_ising(QU, lamb).canonicalize() * 250
 
-# %% [code cell 13]
 print(QU)
 print("Hamiltonian:", H/500)
-# print("H canonicalized:", H.canonicalize())
 idx_1, coeff_1, idx_2_a, idx_2_b, coeff_2 = process_ansatz_values(H)
 
 print(idx_1)
@@ -194,16 +165,13 @@ print(idx_2_a)
 print(idx_2_b)
 print(coeff_2)
 
-# %% [code cell 14]
 @cudaq.kernel
 def kernel_simple(qb:int, idxs: List[int])-> None:
     qvec = cudaq.qvector(qb)
     for idx in idxs:
         x(qvec[idx])
 
-# %% [code cell 15]
 v = np.array(list(map(int, "0111")))
-# print(v.T.shape)
 lambb = 0.01 * 1
 qq = 1
 QU2 = ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lambb, qq)
@@ -213,7 +181,6 @@ print(QU2)
 print(v @ QU2 @ v - lambb)
 print(v @ QU2_lamb @ v - lambb)
 
-# %% [code cell 16]
 def get_init_states_(state_return, num_init_bases, n_qubits):
     sorted_idx = np.argsort(-state_return)
     init_states = []
@@ -221,23 +188,18 @@ def get_init_states_(state_return, num_init_bases, n_qubits):
         init_states.append(bin(i)[2:].zfill(n_qubits))
     return init_states
 
-# %% [code cell 17]
 state = all_state_to_return(len(v), lambb, QU2)
 print(state)
 init_states = get_init_states(state, 4, len(v))
 print(init_states)
 
-# %% [code cell 18]
-# print(cudaq.sample(kernel_simple, n_qubit, 2, shots_count=int(1e4)))
 sss = cudaq.get_state(kernel_simple, n_qubit, [1, 2, 3])
 exp = cudaq.observe(kernel_simple, HH, n_qubit, [1, 2, 3]).expectation()
 print(sss)
 print(exp)
 
-# %% [code cell 19]
 print((P_bb.sum()-1)**2)
 
-# %% [code cell 20]
 s = 1
 for i in range(len(v)):
     # s -= P_bb[i]**2 * v[i]
@@ -247,10 +209,8 @@ for i in range(len(v)):
         s += 1 * P_bb[i] * P_bb[j] * v[i] * v[j]
 print(s * lambb)
 
-# %% [code cell 21]
 print(0.0005**2)
 
-# %% [code cell 22]
 print(P_bb)
 print(ret_bb)
 print(cov_bb, end="\n\n")
@@ -258,23 +218,17 @@ print(cov_bb, end="\n\n")
 print(lambb * (v@P_bb - 1)**2) # Penalty term
 print(-1 * v@ret_bb + qq * v@cov_bb@v + lambb * (v@P_bb - 1)**2) # Min objective
 
-# %% [markdown]
 # # Time Benchmark
 
-# %% [code cell 23]
 print(list(map(int, "0010")))
 
-# %% [code cell 24]
 # qb = 22
 # st = time.time()
 # l = np.zeros((1<<qb, qb))
-# for i in range(1<<qb):
 #     s = bin(i)[2:].zfill(qb)
 #     ll = np.array(list(map(int, s)))
 #     l[i] = ll
-# print(time.time() - st) # 7.1 sec
 
-# %% [code cell 25]
 # qb = 25
 # st = time.time()
 # l = np.zeros((qb, 1<<qb), dtype=np.float32)
@@ -282,26 +236,18 @@ print(list(map(int, "0010")))
 # a_1 = np.ones(1<<qb, dtype=np.float32)
 # idxx = np.arange(1<<qb, dtype=np.int32)
 # # print(a_0, a_1)
-# for i in range(qb):
 #     l[i] = np.where(idxx%(1<<(qb-i))<(1<<(qb-i-1)), a_0,  a_1)
 # # print(l)
-# print(time.time() - st) # 2.7 sec
 
-# %% [code cell 26]
 # qb = 25
 # st = time.time()
 # lt = torch.zeros((qb, 1<<qb), dtype=torch.float32, device='cuda')
-# print(lt.device)
 # a_0 = torch.zeros(1<<qb, dtype=torch.float32, device='cuda')
 # a_1 = torch.ones(1<<qb, dtype=torch.float32, device='cuda')
 # idxx = torch.arange(1<<qb, device='cuda')
-# for i in range(qb):
 #     lt[i] = torch.where(idxx%(1<<(qb-i))<(1<<(qb-i-1)), a_0,  a_1)
 # lt = lt.numpy(force=True)
-# print(time.time() - st) # int8: 0.29s, float32: 1.0s
-# print(lt)
 
-# %% [code cell 27]
 # def state_to_return(s, B, C, d_ret, d_p):
 #     l = np.array(list(map(int, s)))
 #     P = d_p @ C
@@ -311,36 +257,26 @@ print(list(map(int, "0010")))
 #     return ss, bud <= B
 
 # ex_ret, in_budget = state_to_return("0001", B, C, data_ret, data_p)
-# print(ex_ret, in_budget)
 
-# %% [markdown]
 # # CUDA QAOA
 
-# %% [code cell 28]
 idx_1_use, coeff_1_use = idx_1, coeff_1
 idx_2_a_use, idx_2_b_use, coeff_2_use = idx_2_a, idx_2_b, coeff_2
 
 # idx_1_use, coeff_1_use = idx_1_qis, coeff_1_qis
 # idx_2_a_use, idx_2_b_use, coeff_2_use = idx_2_a_qis, idx_2_b_qis, coeff_2_qis
 
-# %% [code cell 29]
 print(H)
 print(n_qubit)
 
-# %% [code cell 30]
 # bases = ["0001", "0010"]
 # T = np.array([[0, 1], [1, 0]])
 # mixer_s, mixer_c, A_all = basis_T_to_pauli(bases, T, len(bases[0]))
-# print(f"{mixer_s}\n{mixer_c}")
-
-# print(A_all.to_matrix())
 
 # # AA_all = A_all.copy()
 # AA_all = 0.25 * spin.x(0) * spin.x(2) + 0.25 * spin.x(0) * spin.z(1) * spin.x(2) \
 #        + 0.25 * spin.y(0) * spin.y(2) + 0.25 * spin.y(0) * spin.z(1) * spin.y(2)
-# print(AA_all.to_matrix())
 
-# %% [code cell 31]
 # init_bases = ["100", "010", "001"]
 # T = np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
 
@@ -365,26 +301,20 @@ print("init_bases:", abs(init_bases))
 # init_state = get_init_states(state_return, in_budget, 0.02, n_qubit)
 # # init_state = get_init_states(state_return, in_budget, 0.2, n_qubit)
 # n_bases = len(init_state)
-# print("n_bases:", n_bases)
 # # print(init_state)
 # T = np.zeros((n_bases, n_bases), dtype=np.float32)
 # T[:-1, 1:] += np.eye(n_bases - 1, dtype=np.float32)
 # T[1:, :-1] += np.eye(n_bases - 1, dtype=np.float32)
 # T[0, -1] = T[-1, 0] = 1.0
-# print(T)
 # mixer_s, mixer_c = basis_T_to_pauli(init_state, T, n_qubit)
 # # mixer_c *= 100
 # init_bases = reversed_str_bases_to_init_state(init_state, n_qubit)
 # # print(f"{mixer_s}\n{mixer_c}")
-# print(mixer_c[0])
-# print("init_bases:", abs(init_bases))
 
-# %% [code cell 32]
 print(mixer_s[:2])
 print(mixer_c[:2])
 print(coeff_1_use)
 
-# %% [code cell 33]
 a = "AB"
 for i, c in enumerate(a):
     print(i, c)
@@ -392,20 +322,17 @@ print()
 for i, c in reversed(list(enumerate(a[:-1]))):
     print(i, c)
 
-# %% [code cell 34]
 def nplize(a):
     for i in range(len(a)):
         a[i] = np.array(a[i])
     return a
 
-# %% [code cell 35]
 a = [[1, 2, np.array(3)], [1, 2, np.array(3)]]
 print(nplize(a))
 a = [1, 2, np.array(3)]
 b = [*a]
 print(b)
 
-# %% [code cell 36]
 def prepare_preserving_ansatz(qubit_count: int, idx_1: List[int], coeff_1: List[float], idx_2_a: List[int], idx_2_b: List[int], coeff_2: List[float], mixer_str: List[cudaq.pauli_word], mixer_coeff: List[float]):
     def generate_list():
         return [[] for _ in range(qubit_count)]
@@ -418,10 +345,8 @@ def prepare_preserving_ansatz(qubit_count: int, idx_1: List[int], coeff_1: List[
         et = entang_l[idx].pop()
         rn = runnum_l[idx].pop()
         mk[rn] = False
-        # print("-", idx, rn, tp, zt, et)
     def add(typee, idx, zeta, idx_en):
         nonlocal cou
-        # print("+", idx, cou, typee, zeta, idx_en)
         type_l[idx].append(typee)
         zeta_l[idx].append(zeta)
         entang_l[idx].append(idx_en)
@@ -437,7 +362,6 @@ def prepare_preserving_ansatz(qubit_count: int, idx_1: List[int], coeff_1: List[
         return abs(val) < bound
     def push(typee, idx, zeta=[0, 0, 0], idx_en=-1): # typee[0: RX, 1: RY, 2: RZ, 3: H, 4: CX-control, 5: CX-target], zeta: (const_coeff, problem_coeff, mixer_coeff)
         nonlocal cou
-        # print("*", idx, cou, typee, zeta, idx_en)
         if len(type_l[idx]) > 0 and type_l[idx][-1] == typee:
             if typee <= 3:
                 if not (is_zero(zeta_l[idx][-1][0] + zeta[0]) and is_zero(zeta_l[idx][-1][1] + zeta[1]) and is_zero(zeta_l[idx][-1][2] + zeta[2])):
@@ -459,7 +383,6 @@ def prepare_preserving_ansatz(qubit_count: int, idx_1: List[int], coeff_1: List[
             if typee == 4:
                 add(5, idx_en, [0, 0, 0], idx)
 
-            # print(idx)
     def push_pauli_string(strr, coeff):
         for i, p in enumerate(strr):
             if p == "X":
@@ -500,37 +423,30 @@ def prepare_preserving_ansatz(qubit_count: int, idx_1: List[int], coeff_1: List[
     for j in range(len(mixer_str)):
         push_pauli_string(mixer_str[j], mixer_coeff[j])
 
-    # print(all_gate[6])
     return [nplize(i) for i in[type_l, zeta_l, entang_l, runnum_l]] + nplize([all_gate, mk])
 
 type_l, zeta_l, entang_l, runnum_l, all_gate, mk = prepare_preserving_ansatz(n_qubit, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use, mixer_s, mixer_c.tolist())
 # type_l, zeta_l, entang_l, runnum_l, all_gate, mk = prepare_preserving_ansatz(n_qubit, idx_1_use, coeff_1_use, [0], [1], [0.3], ["ZZII", "XXZI"], mixer_c[:2].tolist())
 all_gate = all_gate[mk == 1].reshape(-1)
 
-# %% [code cell 37]
 print(mk)
 
-# %% [code cell 38]
-# print(len(all_gate), all_gate)
 ag = all_gate.reshape(-1, 6)
 al = [[] for _ in range(4)]
 for i in range(len(ag)):
     al[int(ag[i][1])].append(ag[i])
-# print(al)
 for ii in range(len(al)):
     print(ii)
     for i in range(len(al[ii])):
         print(al[ii][i].tolist())
     print()
 
-# %% [code cell 39]
 for ii in range(len(type_l)):
     print(ii)
     for i in range(len(type_l[ii])):
         print(type_l[ii][i], zeta_l[ii][i].tolist(), entang_l[ii][i], runnum_l[ii][i])
     print()
 
-# %% [code cell 40]
 @cudaq.kernel
 def kernel_cmpz_Preserved(thetas: List[float], qubit_count: int, layer_count: int, params: List[float], init_sup: List[complex]):
     qreg = cudaq.qvector(init_sup)
@@ -552,26 +468,19 @@ def kernel_cmpz_Preserved(thetas: List[float], qubit_count: int, layer_count: in
             elif typee == 4: # CX-control
                 cx(qreg[idx], qreg[int(params[6*j+5])])
 
-# %% [code cell 41]
 print(cudaq.draw(kernel_qaoa_Preserved, [1.0]*4, n_qubit, 1, idx_1_use, coeff_1_use, [0], [1], [0.3], ["ZZII", "XXZI"], mixer_c[:2], init_bases))
 
-# %% [code cell 42]
 for i in ag:
     print(i.tolist())
 
-# %% [code cell 43]
 print(cudaq.draw(kernel_cmpz_Preserved, [1.0]*4, n_qubit, 1, all_gate, init_bases))
 
-# %% [code cell 44]
 print(mixer_s)
 
-# %% [code cell 45]
 print(cudaq.draw(kernel_qaoa_Preserved, [1]*4, n_qubit, 1, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use, mixer_s, mixer_c, init_bases))
 
-# %% [markdown]
 # # Ansatz Architecture
 
-# %% [code cell 46]
 idx = 3
 layer_count = 5
 ansatz_idx = 0
@@ -580,7 +489,6 @@ parameter_count = layer_count * 2
 optimizer, optimizer_name, FIND_GRAD = get_optimizer(idx)
 
 optimizer.max_iterations = 1000
-
 
 optimizer.initial_parameters = np.random.uniform(-np.pi / 8, np.pi / 8, parameter_count)
 print("Initial parameters = ", optimizer.initial_parameters)
@@ -597,13 +505,10 @@ elif ansatz_idx == 1:
     ansatz_fixed_param = (int(n_qubit), layer_count, preserving_gates, init_bases)
     kernel_qaoa_use = kernel_cmpz_Preserved
 
-# %% [code cell 47]
 print(optimizer.episodes)
 
-# %% [code cell 48]
 assert False
 
-# %% [code cell 49]
 def plot_px_surface(points, nx=80, ny=80, method="linear", title="3D Surface", opacity=0.95):
     x, y, z = points[:, 0], points[:, 1], points[:, 2]
     ux = np.linspace(-5, 5, nx)
@@ -627,7 +532,6 @@ def plot_px_surface(points, nx=80, ny=80, method="linear", title="3D Surface", o
     )
     fig.show()
 
-# %% [code cell 50]
 n_points = 3000
 points = np.random.uniform(-np.pi, np.pi, (n_points, parameter_count))
 pca = PCA(n_components=2)
@@ -639,17 +543,12 @@ for i in pbar:
 points_3d = np.concatenate([points_2d, np.array(expec).reshape(-1, 1)], axis=1)
 print(points_3d.shape)
 
-# %% [code cell 51]
 exp_np = np.array(expec)
-# print(exp_)
 
-# %% [code cell 52]
 plot_px_surface(points_3d, title="Expectation Landscape", opacity=1, method="cubic")
 
-# %% [markdown]
 # # Optimize
 
-# %% [code cell 53]
 expectations = []
 
 def cost_func(parameters):
@@ -672,7 +571,6 @@ def objective_grad_cuda(parameters):
 objective_func = objective_grad_cuda if FIND_GRAD else objective
 print("Required Gradient = ", FIND_GRAD)
 
-# %% [code cell 54]
 st = time.time()
 optimal_expectation, optimal_parameters = optimizer.optimize(
     dimensions=parameter_count, function=objective_func)
@@ -686,7 +584,6 @@ print('optimal_expectation =', optimal_expectation)
 print('optimal_parameters =', optimal_parameters)
 print('Time taken = ', et - st)
 
-# %% [code cell 55]
 shots_count = int(1e6)
 print(f"Sampling {shots_count} times...")
 # result = cudaq.sample(kernel_qaoa, int(n_qubit), layer_count, optimal_parameters, 0, shots_count=shots_count)
@@ -699,19 +596,15 @@ idx_r = 2**n_qubit - 1 - int(idx_b2, 2)
 idx_r_b2 = bin(idx_r)[2:].zfill(n_qubit)
 
 print(idx_b2, result[idx_b2], result[idx_b2]/shots_count)
-# print(idx_r_b2, result[idx_r_b2], result[idx_r_b2]/shots_count)
 print("|q0>|q1>|q2>...")
 
-# %% [code cell 56]
 def state_to_return_(s, QU, lamb):
     l = np.array(list(map(int, s)))
     ss = l @ QU @ l.T
     return ss + lamb
 print(state_to_return_("1111", QU, lamb))
 
-# %% [code cell 57]
 state = cudaq.get_state(kernel_qaoa_use, optimal_parameters, *ansatz_fixed_param)
-# print(state)
 
 rows = []
 col = ["State", "Probability", "Return"]
@@ -726,43 +619,33 @@ for i in range(len(state)):
     if state_high == bb:
         return_high = ret
     prob = abs(state[i])**2
-    # print(prob, abs(state[i])**2)
-    # print(bb, "\t", round(abs(state[i])**2, 4), "\t", round(ret, 4))
     al = np.array([bb, round(abs(state[i])**2, 4), round(ret, 4)])
     rows.append(al)
     ret_sum += ret * prob
-    # print(al)
 
 df = pd.DataFrame(rows, columns=col)
-# print(df)
 print("Expected Return:", round(ret_sum, 4))
 
 # colorr = ["blue" if in_bud == "True" else "red" for in_bud in df["In_Budget"]]
 ex_ret = df["Return"].to_numpy()
-# print(len(state))
 
 print("Best state:", state_best, "Return:", return_best)
 print("Most probable state:", state_high, "Return:", return_high)
 
-# %% [code cell 58]
 print(np.array(state))
 
-# %% [code cell 59]
 assert False
 
-# %% [code cell 60]
 print(result)
 print(np.abs(np.array(state))**2)
 
 stt = cudaq.get_state(kernel_flipped, state, n_qubit)
 print(np.abs(np.array(stt))**2)
 
-# %% [code cell 61]
 result_final = np.zeros(2**n_qubit)
 for i in result:
     result_final[int(i, 2)] = result[i]
 
-# %% [code cell 62]
 # plt.figure(figsize=(100, 15))
 plt.figure(figsize=(15, 5))
 x = np.arange(2**n_qubit)
@@ -778,19 +661,16 @@ plt.title('Distribution of Preserving Mixer')
 # plt.xticks(xlocs, xlabs)
 plt.xticks(x, [f"{i:0{n_qubit}b}" for i in x])
 xlocs, xlabs = plt.xticks()
-# print(xlocs, xlabs)
 for i, s in enumerate(ex_ret):
     plt.text(xlocs[i]-0.4, result_final[i]+result_final[int(state_high, 2)]/80, s)
 
 plt.show()
 
-# %% [markdown]
 # Exhaustive Search
 #
 # x: qubit (100 samples per qubit)
 # y: approx ratio (best vs real best)
 
-# %% [code cell 63]
 plt.figure(figsize=(20, 10))
 for i in range(len(optimizer_names)):
     if os.path.exists(f"./output_PO_mixer/expectations_{optimizer_names[i]}.npy"):
@@ -806,7 +686,6 @@ plt.title(f'Expectations vs Iterations ({n_qubit} qubits)')
 plt.legend()
 plt.show()
 
-# %% [code cell 64]
 plt.figure(figsize=(20, 10))
 for i in range(len(optimizer_names)):
     if os.path.exists(f"./output_PO_mixer/expectations_{optimizer_names[i]}.npy"):
