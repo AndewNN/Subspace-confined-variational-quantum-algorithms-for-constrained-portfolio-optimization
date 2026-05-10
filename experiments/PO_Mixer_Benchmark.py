@@ -1,448 +1,386 @@
-import numpy as np
-import pandas as pd
-import cudaq
-import sys
-import os
-import torch
-from tqdm import tqdm
-import shutil
-import argparse
-sys.path.append(os.path.abspath(".."))
-from Utils.qaoaCUDAQ import po_normalize, ret_cov_to_QUBO, qubo_to_ising, process_ansatz_values,\
-    basis_T_to_pauli, reversed_str_bases_to_init_state, kernel_qaoa_Preserved, kernel_qaoa_X, kernel_flipped, get_optimizer, find_budget,\
-    all_state_to_return, get_init_states, write_df, clip_df
+"""Soft-penalty (X-mixer) baseline benchmark vs. the subspace-confined
+(Preserving-mixer) ansatz, across (qubit, asset, num_init_bases) configs.
 
-import joblib
+Produces per-iteration ``X.csv`` / ``Preserving.csv`` reports and per-iteration
+``expectations_*/expectations_<i>.npy`` artefacts under
+``./experiments/exp_Q*_A*_L*_q*_B*/``. Used to populate Fig. 1 of the paper.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
 import time
 
-# cudaq.mpi.initialize()
-# cudaq.set_target("nvidia")
-cudaq.set_target("nvidia")
-pd.set_option('display.width', 1000)
-np.random.seed(50)
-state = np.random.get_state()
-# with open("rng_state.pkl", "wb") as f:
-#     pickle.dump(state, f)
-all_modes = ["X", "Preserving"]
-report_col = ["Approximate_ratio", "MaxProb_ratio", "init_1_time", "init_2_time", "optim_time", "observe_time"]
+import joblib
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
 
-# PIPELINE PARAMETERS
-LOOP = 100
-oversample_factor = 5
-over_budget_bound = 1.0 # valid budget in [0, B * over_budget_bound]
-min_P, max_P = 125, 250
-hamiltonian_X_boost = 1
-hamiltonian_P_boost = 2000
+import cudaq
+import torch  # noqa: F401  — imported only to print available CUDA devices below
 
-def file_copy(src, dst):
+import _paths  # noqa: F401  (puts project root on sys.path for ``from Utils.…``)
+from Utils.qaoaCUDAQ import (
+    all_state_to_return,
+    basis_T_to_pauli,
+    clip_df,
+    find_budget,
+    get_init_states,
+    get_optimizer,
+    kernel_flipped,
+    kernel_qaoa_Preserved,
+    kernel_qaoa_X,
+    po_normalize,
+    process_ansatz_values,
+    qubo_to_ising,
+    ret_cov_to_QUBO,
+    reversed_str_bases_to_init_state,
+    write_df,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ALL_MODES = ["X", "Preserving"]
+REPORT_COL = [
+    "Approximate_ratio", "MaxProb_ratio",
+    "init_1_time", "init_2_time", "optim_time", "observe_time",
+]
+
+DEFAULT_LOOP_COUNT = 100
+OVERSAMPLE_FACTOR = 5  # samples drawn from copula before price-band filter
+OVER_BUDGET_BOUND = 1.0  # admissible budget band: [0, B * OVER_BUDGET_BOUND]
+MIN_PRICE, MAX_PRICE = 125, 250
+
+DEFAULT_X_BOOST = 1
+DEFAULT_PRESERVING_BOOST = 2000
+
+# Seed for the per-(qubit, asset) RNG snapshot used to draw the asset cloud
+# from the GaussianCopula models. Must remain fixed across runs.
+SEED_SAMPLE_CLOUD = 50
+
+COPULA_PRICE_RETURN_PKL = "./models/gaussian_copula.pkl"
+COPULA_COVARIANCE_PKL = "./models/gaussian_copula_covariance.pkl"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Mixer-benchmark sweep (X vs Preserving)")
+    parser.add_argument("-Q", "--qubit", nargs="+", type=int, default=[5],
+                        help="Target qubit counts, e.g. -Q 4 5 6")
+    parser.add_argument("-A", "--asset", nargs="+", type=int, default=[3, 4, 5],
+                        help="Asset counts, e.g. -A 3 4 5")
+    parser.add_argument("-L", "--lamb", type=int, default=4,
+                        help="Budget penalty λ (used by the X-mixer arm)")
+    parser.add_argument("-B", "--bases", nargs="+", type=int, default=[3, 6, 12],
+                        help="Subspace sizes K, e.g. -B 3 6 12 25")
+    parser.add_argument("-q", type=int, default=0,
+                        help="Volatility weight q")
+    parser.add_argument("-l", "--layer", type=int, default=5,
+                        help="QAOA layers L")
+    parser.add_argument("-st", "--start_iter", type=int, default=0,
+                        help="Resume from this iteration index")
+    parser.add_argument("-ed", "--end_iter", type=int, default=DEFAULT_LOOP_COUNT,
+                        help="Run iterations [start_iter, end_iter)")
+    parser.add_argument("-m", "--mode", nargs="+", type=str, default=ALL_MODES,
+                        help=f"Modes to run, subset of {ALL_MODES}")
+    parser.add_argument("-hx", "--hamiltonian_x_boost", type=float, default=DEFAULT_X_BOOST,
+                        help="X-mixer Hamiltonian boost factor α")
+    parser.add_argument("-hp", "--hamiltonian_p_boost", type=float, default=DEFAULT_PRESERVING_BOOST,
+                        help="Preserving-mixer Hamiltonian boost factor α")
+    return parser.parse_args()
+
+
+def file_copy(src: str, dst: str) -> None:
+    """``shutil.copyfile`` that silently no-ops when src and dst are identical."""
     try:
         shutil.copyfile(src, dst)
     except shutil.SameFileError:
         pass
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Experiment parameter sweep")
 
-    # Qubits (list of ints)
-    parser.add_argument(
-        "-Q", "--qubit",
-        nargs="+", type=int, default=[5],
-        help="List of target qubits, e.g. -Q 4 5 6"
+def _print_devices() -> None:
+    for i in range(torch.cuda.device_count()):
+        print(i, torch.cuda.get_device_name(i))
+    target = cudaq.get_target()
+    print("Number of QPUs:", target.num_qpus())
+
+
+def _draw_asset_universe(n_assets_in, sample_state):
+    np.random.set_state(sample_state)
+    price_return = joblib.load(COPULA_PRICE_RETURN_PKL).sample(
+        int(max(n_assets_in) * DEFAULT_LOOP_COUNT * OVERSAMPLE_FACTOR)
     )
-
-    # Assets (list of ints)
-    parser.add_argument(
-        "-A", "--asset",
-        nargs="+", type=int, default=[3, 4, 5],
-        help="List of asset counts, e.g. -A 3 4 5"
+    price_return = price_return[
+        (price_return["Price"] > MIN_PRICE) & (price_return["Price"] < MAX_PRICE)
+    ]
+    print(price_return.shape)
+    price_return = price_return.to_numpy()
+    assert price_return.shape[0] > max(n_assets_in) * DEFAULT_LOOP_COUNT, (
+        "Increase OVERSAMPLE_FACTOR — not enough samples after price filtering"
     )
-
-    # Lambda
-    parser.add_argument(
-        "-L", "--lamb",
-        type=int, default=4,
-        help="Budget Penalty (float)"
-    )
-
-    # Bases (list of ints)
-    parser.add_argument(
-        "-B", "--bases",
-        nargs="+", type=int, default=[3, 6, 12],
-        help="List of num initial bases, e.g. -B 3 6 12 25"
-    )
-
-    # Volatility
-    parser.add_argument(
-        "-q",
-        type=int, default=0,
-        help="Volatility Weight (float)"
-    )
-
-    # QAOA Layers
-    parser.add_argument(
-        "-l", "--layer",
-        type=int, default=5,
-        help="Number of QAOA layers (int)"
-    )
-
-    # start iter
-    parser.add_argument(
-        "-st", "--start_iter",
-        type=int, default=0,
-        help="Number of iterations (int)"
-    )
-
-    # end iter (run from start to end-1)
-    parser.add_argument(
-        "-ed", "--end_iter",
-        type=int, default=LOOP,
-        help="Number of iterations (int)"
-    )
-
-    # modes (list of str)
-    parser.add_argument(
-        "-m", "--mode",
-        nargs="+", type=str, default=all_modes,
-        help="List of modes, e.g. -m X Preserving"
-    )
-
-    # X mixer Hamiltonian boost
-    parser.add_argument(
-        "-hx", "--hamiltonian_x_boost",
-        type=float, default=hamiltonian_X_boost,
-        help="Hamiltonian boost for X mixer (float)"
-    )
-
-    # Preserving mixer Hamiltonian boost
-    parser.add_argument(
-        "-hp", "--hamiltonian_p_boost",
-        type=float, default=hamiltonian_P_boost,
-        help="Hamiltonian boost for Preserving mixer (float)"
-    )
-
-    return parser.parse_args()
-
-args = parse_args()
-
-# HYPER PARAMETERS
-init_state_ratio = 0.1
-TARGET_QUBIT_IN = args.qubit
-N_ASSETS_IN = args.asset
-LAMB = args.lamb # Budget Penalty
-Q = args.q # Volatility Weight
-LAYER = args.layer
-
-# num_init_bases = int(2**TARGET_QUBIT * init_state_ratio)
-num_init_bases_in = args.bases
-iter_start = args.start_iter
-iter_end = args.end_iter
-modes = args.mode
-hamiltonian_X_boost = args.hamiltonian_x_boost
-hamiltonian_P_boost = args.hamiltonian_p_boost
-
-# print(TARGET_QUBIT_IN)
-# print(N_ASSETS_IN, type(N_ASSETS_IN))
-# print(LAMB)
-# print(Q)
-
-MPI_ENABLE = False
-
-if MPI_ENABLE:
-    print(cudaq.mpi.rank())
-
-for i in range(torch.cuda.device_count()):
-    print(i, torch.cuda.get_device_name(i))
-
-target = cudaq.get_target()
-qpu_count = target.num_qpus()
-print("Number of QPUs:", qpu_count)
+    return price_return
 
 
+def _summarise_run(dir_path: str, modes: list[str]) -> None:
+    """Compute mean approx-ratio / timings for the X and Preserving runs and persist."""
+    if not ("X" in modes and "Preserving" in modes):
+        return
+    df_X = pd.read_csv(f"{dir_path}/X.csv")
+    df_P = pd.read_csv(f"{dir_path}/Preserving.csv")
 
-# with open("rng_state.pkl", "rb") as f:
-#     state = pickle.load(f)
-np.random.set_state(state)
-GM_loaded = joblib.load('./models/gaussian_copula.pkl')
-# samples = GM_loaded.sample(50)
-samples = GM_loaded.sample(int(max(N_ASSETS_IN) * LOOP * oversample_factor))
-samples = samples[(samples["Price"] > min_P) & (samples["Price"] < max_P)]
-# print(samples["Average_Return"].min(), samples["Average_Return"].max())
-# print(samples["Price"].min(), samples["Price"].max())
-print(samples.shape)
-samples = samples.to_numpy()
-assert samples.shape[0] > max(N_ASSETS_IN) * LOOP, "Please increase the oversample factor to get more samples ;-;"
-# sns.jointplot(data=samples, x='Price', y='Average_Return', kind='reg')
-# samples = samples.to_numpy()
-# plt.show()
+    metrics_X = {col: df_X[col].mean() for col in REPORT_COL}
+    metrics_P = {col: df_P[col].mean() for col in REPORT_COL}
 
-#####################################################
-# MAX NUM ASSETS = 50 FOR NOW
-#####################################################
-np.random.set_state(state)
-GM_cov = joblib.load('./models/gaussian_copula_covariance.pkl')
-samples
+    print(f"Approximate ratio  X: {metrics_X['Approximate_ratio']:.4f}, "
+          f"Preserving: {metrics_P['Approximate_ratio']:.4f}")
+    print(f"MaxProb ratio      X: {metrics_X['MaxProb_ratio']:.4f}, "
+          f"Preserving: {metrics_P['MaxProb_ratio']:.4f}")
+    for stage in ("init_1_time", "init_2_time", "optim_time", "observe_time"):
+        print(f"{stage:14s}     X: {metrics_X[stage]*1000:.2f} ms, "
+              f"Preserving: {metrics_P[stage]*1000:.2f} ms")
 
-np.random.set_state(state)
-state_init_loop = np.random.get_state()
-ch_tr = True
-in_min, in_max = int(1e9), -int(1e9)
-for TARGET_QUBIT in TARGET_QUBIT_IN:
-    for N_ASSETS in N_ASSETS_IN:
-        for num_init_bases in num_init_bases_in:
+    df_result = pd.DataFrame(columns=["Mode"] + REPORT_COL)
+    df_result.loc[0] = ["X"] + [metrics_X[c] for c in REPORT_COL]
+    df_result.loc[1] = ["Preserving"] + [metrics_P[c] for c in REPORT_COL]
+    df_result.to_csv(f"{dir_path}/result.csv", index=False)
 
-            if TARGET_QUBIT < N_ASSETS:
-                continue
 
-            print(f"Target Qubit: {TARGET_QUBIT}, N Assets: {N_ASSETS}, Num Init Bases: {num_init_bases}, ST: {iter_start}, ED: {iter_end}, Modes: {modes}")
-            # continue
-            dir_name = f"exp_Q{TARGET_QUBIT}_A{N_ASSETS}_L{LAMB}_q{Q}_B{num_init_bases}"
-            if iter_start != 0 or iter_end != LOOP:
-                dir_name += f"_it{iter_start}-{iter_end-1}"
-            dir_name_Xbase = f"exp_Q{TARGET_QUBIT}_A{N_ASSETS}_L{LAMB}_q{Q}_B3"
-            dir_path = f"./experiments/{dir_name}"
-            dir_path_Xbase = f"./experiments/{dir_name_Xbase}"
-            if os.path.exists(f"{dir_path}/result.csv"):
-                print("Completed")
-                continue
+def main() -> None:
+    cudaq.set_target("nvidia")
+    pd.set_option("display.width", 1000)
 
-            os.makedirs(f"{dir_path}", exist_ok=True)
-            # os.makedirs(f"{dir_path}/Preserving", exist_ok=True)
-            os.makedirs(f"{dir_path}/expectations_X", exist_ok=True)
-            os.makedirs(f"{dir_path}/expectations_Preserving", exist_ok=True)
-            # os.makedirs(f"{dir_path}/iter_states", exist_ok=True)
+    args = parse_args()
+    target_qubit_in = args.qubit
+    n_assets_in = args.asset
+    lamb = args.lamb
+    q_weight = args.q
+    layer_count = args.layer
+    num_init_bases_in = args.bases
+    iter_start = args.start_iter
+    iter_end = args.end_iter
+    modes = args.mode
+    hamiltonian_X_boost = args.hamiltonian_x_boost
+    hamiltonian_P_boost = args.hamiltonian_p_boost
 
-            # continue
+    np.random.seed(SEED_SAMPLE_CLOUD)
+    sample_state = np.random.get_state()
 
-            np.random.set_state(state_init_loop)
-            restore_iter, tmpp = iter_start, int(1e9)
-            if os.path.exists(f"{dir_path}/X.csv") or os.path.exists(f"{dir_path}/Preserving.csv"):
-                for mode in modes:
-                    if os.path.exists(f"{dir_path}/{mode}.csv"):
-                        df = pd.read_csv(f"./{dir_path}/{mode}.csv")
-                        tmpp = min(tmpp, df.shape[0] + iter_start)
-                    else:
-                        tmpp = iter_start
-                restore_iter = max(restore_iter, tmpp) # I don't know what on earth will trigger this max but this is safer YK what I mean
+    _print_devices()
+    samples = _draw_asset_universe(n_assets_in, sample_state)
 
-                for mode in modes:
-                    if not os.path.exists(f"{dir_path}/{mode}.csv"):
-                        continue
-                    df = pd.read_csv(f"./{dir_path}/{mode}.csv")
-                    df = clip_df(df, restore_iter - iter_start)
-                    df.to_csv(f"{dir_path}/{mode}.csv", index=False)
-            else:
-                for curr_dir, dirs, files in os.walk(dir_path):
-                    for file in files:
-                        os.remove(os.path.join(curr_dir, file))
-                        
-            for i in range(restore_iter):
-                np.random.rand(N_ASSETS, N_ASSETS)
-                np.random.uniform(-np.pi / 8, np.pi / 8, LAYER * 4)
+    np.random.set_state(sample_state)
+    state_init_loop = np.random.get_state()
 
-            X_exist = False
-            if os.path.exists(f"{dir_path_Xbase}/X.csv") and pd.read_csv(f"{dir_path_Xbase}/X.csv").shape[0] >= iter_end:
-                file_copy(f"{dir_path_Xbase}/X.csv", f"{dir_path}/X.csv")
-                x_csv = pd.read_csv(f"{dir_path}/X.csv")
-                x_csv = x_csv.iloc[iter_start:iter_end]
-                x_csv.to_csv(f"{dir_path}/X.csv", index=False)
-                # shutil.copytree(f"{dir_path_Xbase}/expectations_X", f"{dir_path}/expectations_X", dirs_exist_ok=True)
-                for f_i in range(iter_start, iter_end):
-                    file_copy(f"{dir_path_Xbase}/expectations_X/expectations_{f_i}.npy", f"{dir_path}/expectations_X/expectations_{f_i}.npy")
-                X_exist = True
+    in_min, in_max = int(1e9), -int(1e9)
 
-            pbar = tqdm(range(restore_iter, iter_end))
-            for i in pbar:
-                # if i == 1 and ch_tr:
-                #     # tr = tracker.SummaryTracker()
-                #     print("Start Tracking GB")
-                #     ch_tr = False
+    for target_qubit in target_qubit_in:
+        for n_assets in n_assets_in:
+            for num_init_bases in num_init_bases_in:
+                if target_qubit < n_assets:
+                    continue
 
-                pbar.set_description("global:init_1")
-                st = time.time()
+                print(
+                    f"Target Qubit: {target_qubit}, N Assets: {n_assets}, "
+                    f"Num Init Bases: {num_init_bases}, ST: {iter_start}, "
+                    f"ED: {iter_end}, Modes: {modes}"
+                )
+                dir_name = f"exp_Q{target_qubit}_A{n_assets}_L{lamb}_q{q_weight}_B{num_init_bases}"
+                if iter_start != 0 or iter_end != DEFAULT_LOOP_COUNT:
+                    dir_name += f"_it{iter_start}-{iter_end - 1}"
+                dir_name_Xbase = f"exp_Q{target_qubit}_A{n_assets}_L{lamb}_q{q_weight}_B3"
+                dir_path = f"./experiments/{dir_name}"
+                dir_path_Xbase = f"./experiments/{dir_name_Xbase}"
 
-                P = samples[i * N_ASSETS:(i + 1) * N_ASSETS, 0]
-                ret = samples[i * N_ASSETS:(i + 1) * N_ASSETS, 1]
-                # print(P)
-                # print(ret)
-                
-                # P = np.array([195.27, 183.26, 131.3])
-                # ret = np.array([0.00107, 0.00083, 0.00071])
-                cov = np.random.rand(N_ASSETS, N_ASSETS)
-                cov += cov.T
-                # print(cov)
-                q = Q # Volatility Weight
-                B = find_budget(TARGET_QUBIT, P, min_P, max_P)
-                # break
-                # B = 270
-                P_bb, ret_bb, cov_bb, n_qubit, n_max, C = po_normalize(B, P, ret, cov)
-                state_return, in_budget = all_state_to_return(B, C, ret, P, over_budget_bound)
-                init_state = get_init_states(state_return, in_budget, num_init_bases, n_qubit)
+                if os.path.exists(f"{dir_path}/result.csv"):
+                    print("Completed")
+                    continue
 
-                # print(P)
-                # print(ret)
-                # print(B)
-                # print(init_state)
-                # exit()
+                os.makedirs(dir_path, exist_ok=True)
+                os.makedirs(f"{dir_path}/expectations_X", exist_ok=True)
+                os.makedirs(f"{dir_path}/expectations_Preserving", exist_ok=True)
 
-                # print(in_budget.sum())
-                in_min, in_max = min(in_min, in_budget.sum()), max(in_max, in_budget.sum())
-                # continue
+                np.random.set_state(state_init_loop)
 
-                feasible_state_return = state_return * in_budget
-                max_return = state_return[int(init_state[0], 2)]
+                # Resume logic: figure out where to pick up if any per-mode CSV
+                # exists, then truncate any rows past the resume point so each
+                # mode's CSV ends at the same iteration index.
+                restore_iter = iter_start
+                if any(os.path.exists(f"{dir_path}/{m}.csv") for m in modes):
+                    tmpp = int(1e9)
+                    for mode in modes:
+                        if os.path.exists(f"{dir_path}/{mode}.csv"):
+                            df = pd.read_csv(f"./{dir_path}/{mode}.csv")
+                            tmpp = min(tmpp, df.shape[0] + iter_start)
+                        else:
+                            tmpp = iter_start
+                    restore_iter = max(restore_iter, tmpp)
+                    for mode in modes:
+                        path = f"{dir_path}/{mode}.csv"
+                        if not os.path.exists(path):
+                            continue
+                        clip_df(pd.read_csv(path), restore_iter - iter_start).to_csv(
+                            path, index=False,
+                        )
+                else:
+                    for curr_dir, _, files in os.walk(dir_path):
+                        for f in files:
+                            os.remove(os.path.join(curr_dir, f))
 
-                init_1_time = time.time() - st
-                # print(f"initial: {init_1_time*1000:.2f} ms.")
+                for _ in range(restore_iter):
+                    np.random.rand(n_assets, n_assets)
+                    np.random.uniform(-np.pi / 8, np.pi / 8, layer_count * 4)
 
-                for mode in all_modes:
-                    if mode not in modes:
-                        np.random.uniform(-np.pi / 8, np.pi / 8, 2 * LAYER)
-                        continue
-                    if mode == "X" and X_exist:
-                        np.random.uniform(-np.pi / 8, np.pi / 8, 2 * LAYER)
-                        continue
-                    pbar.set_description(f"{mode}:init_2")
+                # If a B=3 X-mixer baseline already covers this (Q, A) config,
+                # reuse it instead of recomputing.
+                X_exist = False
+                xbase_csv = f"{dir_path_Xbase}/X.csv"
+                if os.path.exists(xbase_csv) and pd.read_csv(xbase_csv).shape[0] >= iter_end:
+                    file_copy(xbase_csv, f"{dir_path}/X.csv")
+                    pd.read_csv(f"{dir_path}/X.csv").iloc[iter_start:iter_end].to_csv(
+                        f"{dir_path}/X.csv", index=False,
+                    )
+                    for f_i in range(iter_start, iter_end):
+                        file_copy(
+                            f"{dir_path_Xbase}/expectations_X/expectations_{f_i}.npy",
+                            f"{dir_path}/expectations_X/expectations_{f_i}.npy",
+                        )
+                    X_exist = True
+
+                pbar = tqdm(range(restore_iter, iter_end))
+                for i in pbar:
+                    pbar.set_description("global:init_1")
                     st = time.time()
-                    lamb = LAMB if mode == "X" else 0 # Budget Penalty
 
-                    QU = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, lamb, q)
-                    hamiltonian_boost = (hamiltonian_X_boost if mode == "X" else hamiltonian_P_boost)
-                    H = qubo_to_ising(QU, lamb).canonicalize() * (hamiltonian_X_boost if mode == "X" else hamiltonian_P_boost)
-                    QU_0 = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, 0, q)
-                    H_0 = qubo_to_ising(QU_0, 0).canonicalize()
-                    idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use = process_ansatz_values(H)
+                    price = samples[i * n_assets:(i + 1) * n_assets, 0]
+                    returns = samples[i * n_assets:(i + 1) * n_assets, 1]
+                    cov = np.random.rand(n_assets, n_assets)
+                    cov += cov.T
 
-                    kernel_qaoa_use = kernel_qaoa_X if mode == "X" else kernel_qaoa_Preserved
-                    # kernel_qaoa_use = kernel_qaoa_X if mode == "X" else kernel_cmpz_Preserved
+                    budget = find_budget(target_qubit, price, MIN_PRICE, MAX_PRICE)
+                    P_bb, ret_bb, cov_bb, n_qubit, _, C = po_normalize(budget, price, returns, cov)
+                    state_return, in_budget = all_state_to_return(
+                        budget, C, returns, price, OVER_BUDGET_BOUND,
+                    )
+                    init_state = get_init_states(state_return, in_budget, num_init_bases, n_qubit)
 
-                    idx = 3
-                    layer_count = LAYER
-                    parameter_count = layer_count * 2
-                    optimizer, optimizer_name, FIND_GRAD = get_optimizer(idx)
-                    optimizer.max_iterations = 1000
-                    optimizer.initial_parameters = np.random.uniform(-np.pi / 8, np.pi / 8, 2 * LAYER)
-                    
+                    in_min = min(in_min, in_budget.sum())
+                    in_max = max(in_max, in_budget.sum())
 
-                    if mode == "X":
-                        ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use)
+                    feasible_state_return = state_return * in_budget
+                    max_return = state_return[int(init_state[0], 2)]
+                    init_1_time = time.time() - st
+
+                    for mode in ALL_MODES:
+                        # Skip-but-still-advance-RNG: keep the parameter draw
+                        # in sync across runs that include / exclude a mode.
+                        if mode not in modes or (mode == "X" and X_exist):
+                            np.random.uniform(-np.pi / 8, np.pi / 8, 2 * layer_count)
+                            continue
+
+                        pbar.set_description(f"{mode}:init_2")
+                        st = time.time()
+                        # X mixer keeps the budget penalty term; Preserving zeroes
+                        # it out (feasibility is enforced architecturally instead).
+                        eff_lamb = lamb if mode == "X" else 0
+                        boost = hamiltonian_X_boost if mode == "X" else hamiltonian_P_boost
+
+                        QU = -ret_cov_to_QUBO(ret_bb, cov_bb, P_bb, eff_lamb, q_weight)
+                        H = qubo_to_ising(QU, eff_lamb).canonicalize() * boost
+                        idx_1, c1, idx_2_a, idx_2_b, c2 = process_ansatz_values(H)
+
+                        kernel = kernel_qaoa_X if mode == "X" else kernel_qaoa_Preserved
+                        parameter_count = layer_count * 2
+
+                        # Optimizer index 3 = the configured Adam wrapper.
+                        # See Utils/qaoaCUDAQ.get_optimizer for the full mapping.
+                        OPTIMIZER_IDX = 3
+                        optimizer, _, FIND_GRAD = get_optimizer(OPTIMIZER_IDX)
+                        optimizer.max_iterations = 1000
+                        optimizer.initial_parameters = np.random.uniform(
+                            -np.pi / 8, np.pi / 8, 2 * layer_count,
+                        )
+
+                        if mode == "X":
+                            ansatz_fixed_param = (
+                                int(n_qubit), layer_count, idx_1, c1, idx_2_a, idx_2_b, c2,
+                            )
+                        else:
+                            n_bases = len(init_state)
+                            T = np.zeros((n_bases, n_bases), dtype=np.float32)
+                            T[:-1, 1:] += np.eye(n_bases - 1, dtype=np.float32)
+                            T[1:, :-1] += np.eye(n_bases - 1, dtype=np.float32)
+                            T[0, -1] = T[-1, 0] = 1.0
+                            mixer_s, mixer_c = basis_T_to_pauli(init_state, T, n_qubit)
+                            init_bases = reversed_str_bases_to_init_state(init_state, n_qubit)
+                            ansatz_fixed_param = (
+                                int(n_qubit), layer_count, idx_1, c1, idx_2_a, idx_2_b, c2,
+                                mixer_s, mixer_c, init_bases,
+                            )
                         init_2_time = time.time() - st
-                        # print(f"init for {mode}: {init_2_time*1000:.2f} ms.")
-                    else:
-                        n_bases = len(init_state)
-                        # print("n_bases:", n_bases)
-                        T = np.zeros((n_bases, n_bases), dtype=np.float32)
-                        T[:-1, 1:] += np.eye(n_bases - 1, dtype=np.float32)
-                        T[1:, :-1] += np.eye(n_bases - 1, dtype=np.float32)
-                        T[0, -1] = T[-1, 0] = 1.0
-                        # print(T)
-                        mixer_s, mixer_c = basis_T_to_pauli(init_state, T, n_qubit)
-                        init_bases = reversed_str_bases_to_init_state(init_state, n_qubit)
 
-                        ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use, mixer_s, mixer_c, init_bases)
+                        pbar.set_description(f"{mode}:optim")
+                        st = time.time()
+                        expectations: list[float] = []
 
-                        # preserving_gates = prepare_preserving_ansatz(n_qubit, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use, mixer_s, mixer_c.tolist())
-                        # ansatz_fixed_param = (int(n_qubit), layer_count, preserving_gates, init_bases)
+                        def cost_func(parameters, cal_expectation=False):
+                            return float(
+                                cudaq.observe(kernel, H, parameters, *ansatz_fixed_param).expectation()
+                            ) / boost
 
-                        # preserving_gates, mk = prepare_preserving_ansatz(n_qubit, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use, mixer_s, mixer_c.tolist())[-2:]
-                        # preserving_gates = preserving_gates[mk == 1].reshape(-1)
-                        # ansatz_fixed_param = (int(n_qubit), layer_count, preserving_gates, init_bases)
+                        def objective(parameters):
+                            return cost_func(parameters, cal_expectation=True)
+
+                        fd = cudaq.gradients.ForwardDifference()
+
+                        def objective_grad_cuda(parameters):
+                            expectation = cost_func(parameters, cal_expectation=True)
+                            gradient = fd.compute(parameters, cost_func, expectation)
+                            return expectation, gradient
+
+                        objective_func = objective_grad_cuda if FIND_GRAD else objective
+                        _, optimal_parameters = optimizer.optimize(
+                            dimensions=parameter_count, function=objective_func,
+                        )
+                        np.save(
+                            f"{dir_path}/expectations_{mode}/expectations_{i}.npy",
+                            np.array(expectations),
+                        )
+                        optim_time = time.time() - st
+
+                        pbar.set_description(f"{mode}:observe")
+                        st = time.time()
+                        result = cudaq.get_state(kernel, optimal_parameters, *ansatz_fixed_param)
+                        idx_r_best = np.argmax(np.abs(result))
+                        idx_best = bin(idx_r_best)[2:].zfill(n_qubit)[::-1]
+
+                        result_r = cudaq.get_state(kernel_flipped, result, target_qubit)
+                        prob = np.abs(result_r) ** 2
+
+                        approx_ratio = (prob * feasible_state_return).sum() / max_return
+                        maxprob_ratio = (
+                            state_return[int(idx_best, 2)] / max_return
+                            if in_budget[int(idx_best, 2)] else 0.0
+                        )
+                        observe_time = time.time() - st
+
+                        write_df(
+                            f"{dir_path}/{mode}.csv", REPORT_COL,
+                            approx_ratio, maxprob_ratio,
+                            init_1_time, init_2_time, optim_time, observe_time,
+                        )
+
+                print(f"Min:Max feasible states: {in_min}:{in_max}")
+                if in_min < num_init_bases:
+                    with open(f"{dir_path}/flag.txt", "w") as f:
+                        f.write(
+                            f"Min feasible states {in_min} < num_init_bases {num_init_bases}\n"
+                            f"(Max feasible states {in_max})\n"
+                        )
+
+                _summarise_run(dir_path, modes)
 
 
-                        init_2_time = time.time() - st
-                        # print(f"Init for {mode}: {init_2_time*1000:.2f} ms.")
-                    # print(cudaq.draw(kernel_qaoa_use, [0.5]*4, *ansatz_fixed_param[:1], 1, *ansatz_fixed_param[2:]))
-
-                    pbar.set_description(f"{mode}:optim")
-                    st = time.time()
-                    expectations = []
-                    # expectations2 = []
-                    # expectations3 = []
-                    def cost_func(parameters, cal_expectation=False):
-                        # return cudaq.observe(kernel_qaoa, H, n_qubit, layer_count, parameters, 0).expectation()
-                        exp_return = float(cudaq.observe(kernel_qaoa_use, H, parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
-                        if cal_expectation:
-                            # exp_return_in = float(cudaq.observe(kernel_qaoa_use, H_0, parameters, *ansatz_fixed_param).expectation())
-                            # expectations.append([exp_return_in, exp_return])
-                            pass
-                        return exp_return
-                        #     exp_return = cudaq.observe(kernel_qaoa_use, H_0, parameters, *ansatz_fixed_param, execution=cudaq.parallel.thread).expectation()
-                        #     expectations.append(exp_return)
-                        # return cudaq.observe(kernel_qaoa_use, H, parameters, *ansatz_fixed_param, execution=cudaq.parallel.thread).expectation()
-
-                    def objective(parameters):
-                        expectation = cost_func(parameters, cal_expectation=True)
-                        # expectations3.append(expectation)
-                        return expectation
-
-                    fd = cudaq.gradients.ForwardDifference()
-                    def objective_grad_cuda(parameters):
-                        expectation = cost_func(parameters, cal_expectation=True)
-                        # expectations3.append(expectation)
-
-                        gradient = fd.compute(parameters, cost_func, expectation)
-
-                        return expectation, gradient
-
-                    objective_func = objective_grad_cuda if FIND_GRAD else objective
-
-                    optimal_expectation, optimal_parameters = optimizer.optimize(
-                        dimensions=parameter_count, function=objective_func)
-                    np.save(f"{dir_path}/expectations_{mode}/expectations_{i}.npy", np.array(expectations))
-                    optim_time = time.time() - st
-                    # print(f"Optimization for {mode}: {optim_time*1000:.2f} ms.")
-                    
-                    pbar.set_description(f"{mode}:observe")
-                    st = time.time()
-                    result = cudaq.get_state(kernel_qaoa_use, optimal_parameters, *ansatz_fixed_param)
-                    idx_r_best = np.argmax(np.abs(result))
-                    idx_best = bin(idx_r_best)[2:].zfill(n_qubit)[::-1]
-
-                    result_r = cudaq.get_state(kernel_flipped, result, TARGET_QUBIT)
-                    prob = np.abs(result_r)**2
-
-                    approx_ratio = (prob * (feasible_state_return)).sum() / max_return
-                    maxprob_ratio = state_return[int(idx_best, 2)] / max_return if in_budget[int(idx_best, 2)] else 0.0
-
-                    observe_time = time.time() - st
-
-                    write_df(f"{dir_path}/{mode}.csv", report_col,
-                                approx_ratio, maxprob_ratio, init_1_time, init_2_time, optim_time, observe_time)
-                    # gc.collect()
-            print(f"Min:Max feasible states: {in_min}:{in_max}")
-            if in_min < num_init_bases:
-                with open(f"{dir_path}/flag.txt", "w") as f:
-                    f.write(f"Min feasible states {in_min} < num_init_bases {num_init_bases}\n")
-                    f.write(f"(Max feasible states {in_max})\n")
-                    f.close()
-            if "X" in modes and "Preserving" in modes:
-                df_X = pd.read_csv(f"{dir_path}/X.csv")
-                df_P = pd.read_csv(f"{dir_path}/Preserving.csv")
-
-                approx_X = df_X["Approximate_ratio"].mean()
-                approx_P = df_P["Approximate_ratio"].mean()
-                print(f"Approximate ratio for X: {approx_X:.4f}, Preserving: {approx_P:.4f}")
-
-                maxprob_X = df_X["MaxProb_ratio"].mean()
-                maxprob_P = df_P["MaxProb_ratio"].mean()
-                print(f"MaxProb ratio for X: {maxprob_X:.4f}, Preserving: {maxprob_P:.4f}")
-
-                init_1_time_X = df_X["init_1_time"].mean()
-                init_2_time_X = df_X["init_2_time"].mean()
-                optim_time_X = df_X["optim_time"].mean()
-                observe_time_X = df_X["observe_time"].mean()
-
-                init_1_time_P = df_P["init_1_time"].mean()
-                init_2_time_P = df_P["init_2_time"].mean()
-                optim_time_P = df_P["optim_time"].mean()
-                observe_time_P = df_P["observe_time"].mean()
-
-                print(f"Init 1 time for X: {init_1_time_X*1000:.2f} ms, Preserving: {init_1_time_P*1000:.2f} ms")
-                print(f"Init 2 time for X: {init_2_time_X*1000:.2f} ms, Preserving: {init_2_time_P*1000:.2f} ms")
-                print(f"Optim time for X: {optim_time_X*1000:.2f} ms, Preserving: {optim_time_P*1000:.2f} ms")
-                print(f"Observe time for X: {observe_time_X*1000:.2f} ms, Preserving: {observe_time_P*1000:.2f} ms")
-
-                col_result = ["Mode"] + report_col
-                df_result = pd.DataFrame(columns=col_result)
-                df_result.loc[0] = ["X", approx_X, maxprob_X, init_1_time_X, init_2_time_X, optim_time_X, observe_time_X]
-                df_result.loc[1] = ["Preserving", approx_P, maxprob_P, init_1_time_P, init_2_time_P, optim_time_P, observe_time_P]
-                df_result.to_csv(f"{dir_path}/result.csv", index=False)
+if __name__ == "__main__":
+    main()
