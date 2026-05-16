@@ -34,11 +34,11 @@ except ImportError:
 # paper's [108, 216] USD band, sufficient for a smoke test of the pipeline.
 # ---------------------------------------------------------------------------
 TICKERS: list[str] = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "JNJ",
-    "WMT", "MA", "PG", "UNH", "HD", "BAC", "DIS", "ADBE", "CRM", "NFLX",
-    "KO", "PFE", "INTC", "CSCO", "PEP", "ABT", "ABBV", "COST", "NKE", "TMO",
-    "MRK", "AVGO", "MCD", "ACN", "T", "NEE", "LIN", "DHR", "TXN", "QCOM",
-    "BMY", "AMGN", "HON", "LOW", "UPS", "IBM", "MS", "GS", "CAT", "LMT",
+    'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'AMD', 'AMZN', 'AVGO', 'BMY', 'BRK-B', 
+    'CMCSA', 'COST', 'CRM', 'CSCO', 'CVX', 'DHR', 'DIS', 'GOOG', 'GOOGL', 'HD', 
+    'INTC', 'JNJ', 'JPM', 'KO', 'LLY', 'MA', 'MCD', 'META', 'MRK', 'MSFT', 'NEE', 
+    'NKE', 'NVDA', 'PEP', 'PFE', 'PG', 'PM', 'RTX', 'SPGI', 'T', 'TMO', 'TSLA', 
+    'TXN', 'UNH', 'UPS', 'V', 'VZ', 'WFC', 'WMT', 'XOM',
 ]
 
 START_DATE = "2015-04-01"
