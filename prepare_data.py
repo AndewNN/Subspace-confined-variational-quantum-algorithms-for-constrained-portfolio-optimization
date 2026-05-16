@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 try:
     import yfinance as yf
@@ -40,6 +41,12 @@ TICKERS: list[str] = [
     'NKE', 'NVDA', 'PEP', 'PFE', 'PG', 'PM', 'RTX', 'SPGI', 'T', 'TMO', 'TSLA', 
     'TXN', 'UNH', 'UPS', 'V', 'VZ', 'WFC', 'WMT', 'XOM',
 ]
+
+COMPANY_NAMES: dict[str, str] = {
+    ticker: yf.Ticker(ticker).info["longName"] for ticker in tqdm(TICKERS)
+}
+
+print("Company names:", COMPANY_NAMES)
 
 START_DATE = "2015-04-01"
 END_DATE = "2025-04-01"
@@ -82,7 +89,7 @@ def build_returns_price(closes: pd.DataFrame) -> pd.DataFrame:
         "Price": last_price.values,
         # Company_Name is informational only; keep blank to avoid hammering
         # yfinance with one .info call per ticker.
-        "Company_Name": closes.columns,
+        "Company_Name": [COMPANY_NAMES.get(t, "") for t in closes.columns],
     })
     return out
 
