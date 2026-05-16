@@ -119,7 +119,8 @@ cd experiments
 #### Soft-penalty baseline (§03 of the paper)
 
 ```shell
-python PO_Mixer_Benchmark.py -Q 10 -A 3 -B 3 6 12
+python PO_Mixer_Benchmark.py -Q 10 -A 3 -m X  -q 1.5 -L 0.0005 -b_X 5000 -E 10 -p 5
+python PO_Mixer_Benchmark.py -Q 10 -A 3 -m Preserving -B 12 -q 1.5 -L 0.0005 -b_P 10500 -E 10 -p 5
 ```
 
 `-Q` = qubit count, `-A` = asset configuration, `-B` = list of subspace sizes to sweep. The orchestration script `../scripts/run_mixer_benchmark.sh` runs the exact sweeps used to produce Fig. 1:
@@ -134,8 +135,7 @@ bash ../scripts/run_mixer_benchmark.sh merge 4 3 3    # 4-way Preserving + merge
 #### Barren-plateau diagnostics (§03b)
 
 ```shell
-python PO_X_Plateau.py -Q 10 -A 3
-python PO_new_Plateau.py -Q 10 -A 3
+python PO_new_Plateau.py -Q 2 -A 2 3 4 5 6 7 8 -N 2000 -E 20 -p 5 -Z 2 3 -L 0.0005 -q 1.5 -m Preserving -B 12
 ```
 
 The orchestration script `../scripts/run_plateau.sh` runs the full plateau sweep:
@@ -148,10 +148,10 @@ bash ../scripts/run_plateau.sh preserving             # Preserving-mixer plateau
 #### Subspace-confined QAOA (§04, §07, §08)
 
 ```shell
-python PO_new_ApproxRatio.py -Q 10 -A 3 -K 12
+python PO_new_ApproxRatio.py -Q 10 -A 3 -B 12
 ```
 
-`-K` = working-subspace dimension (the paper reports `K ∈ {12, 24}`). The orchestration script `../scripts/run_approx.sh` provides the canonical presets:
+`-B` = working-subspace dimension (the paper reports `B ∈ {12, 24}`). The orchestration script `../scripts/run_approx.sh` provides the canonical presets:
 
 ```shell
 bash ../scripts/run_approx.sh preserving_K24          # main SC-QAOA config (Fig 5)
