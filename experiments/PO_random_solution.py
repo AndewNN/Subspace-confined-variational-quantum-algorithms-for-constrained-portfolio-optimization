@@ -59,7 +59,7 @@ if __name__ == "__main__":
     # Assume that already set CUDA_VISIBLE_DEVICES
     device = torch.device("cuda:0")
 
-    report_col = ["Assets", "Exp", "Point", "Qubits", "Approximate_ratio", "Return", "Risk", "Budget_Violations", "Budget", "MaxProb_ratio", "init_1_time", "init_2_time", "optim_time", "epochs", "observe_time"]
+    report_col = ["Assets", "Exp", "Seed", "Qubits", "Approximate_ratio", "Return", "Risk", "Budget_Violations", "Budget", "MaxProb_ratio", "init_1_time", "init_2_time", "optim_time", "epochs", "observe_time"]
 
     TARGET_QUBIT_IN = 3
     TARGET_ASSET = [3, 4, 5, 6, 7]
@@ -554,7 +554,7 @@ if __name__ == "__main__":
             #     optimizer.max_iterations = 300
             
             for idx_point in range(num_points):
-                np.random.seed(4001 + 4099 * e + 4999 * N_ASSETS + 967 * idx_point)
+                np.random.seed(4001 + 4099 * e + 4999 * N_ASSETS + 5099 * idx_point)
                 points = np.random.uniform(-1, 1, (parameter_count))
                 points[::2] *= mm_i
                 points[1::2] *= np.pi
