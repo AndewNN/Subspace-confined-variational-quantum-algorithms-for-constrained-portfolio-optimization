@@ -107,13 +107,13 @@ This writes:
 - `dataset/top_50_us_stocks_returns_price.csv` — per-ticker mean return + last close + name
 - `dataset/top_50_us_stocks_data_20250526_011226_covariance.csv` — daily-return covariance matrix
 
-> ### ⚠️ The shipped ticker list is a placeholder — published numbers will not reproduce
+> ### ⚠️ Re-downloading will not exactly reproduce the published numbers
 >
-> The `TICKERS` list at the top of `prepare_data.py` is a **placeholder** of large-cap US equities chosen to span a price range comparable to the paper's `[108, 216]` USD band. It is **not** the 50-ticker universe used in the paper, and no dataset is distributed with this repository.
+> `TICKERS` in `prepare_data.py` **is** the 50-ticker universe used in the paper, but no dataset CSVs are distributed with this repository — `prepare_data.py` re-fetches them from Yahoo Finance.
 >
-> As shipped, the pipeline therefore runs end-to-end as a **smoke test** — every stage executes and produces well-formed output — but **none of the numbers, tables or figures will match the published results.**
+> Yahoo's adjusted-close series are revised over time by splits and dividend adjustments, so a fetch today yields slightly different mean returns and covariances than the 2025-05-26 snapshot the paper was built on. Results will be close but **not identical** to the published tables and figures.
 >
-> To reproduce the paper you need the original universe and the price snapshot it was built from. Note that re-downloading from Yahoo Finance will not recover it even with the correct tickers: adjusted-close series are revised over time by splits and dividend adjustments, so a fetch today yields different returns and covariances than the 2025-05-26 snapshot the paper used. Please contact the authors for the exact dataset.
+> For exact reproduction, request the original two CSVs from the authors and drop them into `dataset/`, skipping Stage 1 entirely.
 
 ### Stage 2 — Run the experiments
 
@@ -126,7 +126,8 @@ cd experiments
 #### Soft-penalty baseline (§03 of the paper)
 
 ```shell
-python PO_Mixer_Benchmark.py -Q 10 -A 3 -B 3 6 12
+python PO_Mixer_Benchmark.py -Q 10 -A 3 -m X  -q 1.5 -L 0.0005 -b_X 5000 -E 10 -p 5
+python PO_Mixer_Benchmark.py -Q 10 -A 3 -m Preserving -B 12 -q 1.5 -L 0.0005 -b_P 10500 -E 10 -p 5
 ```
 
 `-Q` = qubit count, `-A` = asset configuration, `-B` = list of subspace sizes to sweep. The orchestration script `../scripts/run_mixer_benchmark.sh` runs the exact sweeps used to produce Fig. 1:
@@ -141,8 +142,7 @@ bash ../scripts/run_mixer_benchmark.sh merge 4 3 3    # 4-way Preserving + merge
 #### Barren-plateau diagnostics (§03b)
 
 ```shell
-python PO_X_Plateau.py -Q 10 -A 3
-python PO_new_Plateau.py -Q 10 -A 3
+python PO_new_Plateau.py -Q 2 -A 2 3 4 5 6 7 8 -N 2000 -E 20 -p 5 -Z 2 3 -L 0.0005 -q 1.5 -m Preserving -B 12
 ```
 
 The orchestration script `../scripts/run_plateau.sh` runs the full plateau sweep:

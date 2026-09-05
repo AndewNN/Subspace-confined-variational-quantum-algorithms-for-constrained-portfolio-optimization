@@ -156,7 +156,7 @@ if __name__ == "__main__":
         # Volatility
         parser.add_argument(
             "-q",
-            type=float, default=1.0,
+            type=float, default=1.5,
             help="Volatility Weight (float)"
         )
 

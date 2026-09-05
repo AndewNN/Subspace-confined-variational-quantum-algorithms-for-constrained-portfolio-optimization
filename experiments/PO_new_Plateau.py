@@ -135,8 +135,9 @@ def main() -> None:
 
     returns_price, covariance = load_universe(MIN_PRICE, MAX_PRICE)
     cov_no_ticker = covariance.drop("Ticker", axis=1)
+    ret_no_ticker = returns_price.drop("Ticker", axis=1)
     # Company_Name is a string column — dropping it keeps the ndarray numeric.
-    ret_no_ticker = returns_price.drop(["Ticker", "Company_Name"], axis=1)
+    ret_no_ticker = ret_no_ticker.drop("Company_Name", axis=1)
 
     dir_name = f"exp_p{layer_count}_L{_format_param(lamb)}_q{_format_param(q_weight)}"
     dir_path = (
@@ -166,6 +167,8 @@ def main() -> None:
             # Per-experiment seed mixing — fixed primes so each (e, n_assets)
             # cell gets a unique but reproducible RNG state.
             np.random.seed(911 + 991 * e + 997 * n_assets)
+            state = np.random.get_state()
+
             asset_idx = np.random.choice(cov_no_ticker.shape[0], n_assets, replace=False)
             data_cov = cov_no_ticker.to_numpy()[asset_idx, :][:, asset_idx]
             data_ret_p = ret_no_ticker.to_numpy()[asset_idx, :]
@@ -173,12 +176,12 @@ def main() -> None:
             data_p = data_ret_p[:, 1]
 
             # Pick a budget uniformly between the min and max attainable for this universe.
+            np.random.set_state(state)
             weighted = np.random.uniform(0, 1)
             B_min, B_max = find_budget(
                 target_qubit * n_assets, data_p, MIN_PRICE, MAX_PRICE, min_mix_mode=True,
             )
             budget = B_min * weighted + B_max * (1 - weighted)
-
             P_bb, ret_bb, cov_bb, n_qubit, _, _ = po_normalize(
                 budget, data_p[:n_assets], data_ret[:n_assets], data_cov[:n_assets, :n_assets],
             )
