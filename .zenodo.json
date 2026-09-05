@@ -1,0 +1,42 @@
+{
+  "title": "Subspace-Confined Variational Quantum Algorithms for Constrained Portfolio Optimization",
+  "description": "<p>Reference implementation accompanying the paper <em>Subspace-Confined Variational Quantum Algorithms for Constrained Portfolio Optimization</em> (IEEE Transactions on Quantum Engineering).</p><p>Contains the CUDA-Q implementation of the soft-penalty (SP) and subspace-confined (SC) ans&auml;tze, the C++/pybind11 genetic-algorithm solver used to construct the low-violation working subspace, the experiment scripts with fixed random seeds, the figure-generation scripts, and the script that rebuilds the price dataset from public sources.</p>",
+  "upload_type": "software",
+  "license": "MIT",
+  "access_right": "open",
+  "creators": [
+    {
+      "name": "Namson, Naravit",
+      "affiliation": "Department of Computer Engineering, Faculty of Engineering, Chulalongkorn University, Bangkok, Thailand"
+    },
+    {
+      "name": "Sangkaew, Koravich",
+      "affiliation": "SCBX Company, Limited, Bangkok, Thailand"
+    },
+    {
+      "name": "Suksen, Kamonluk",
+      "affiliation": "Department of Computer Engineering, Faculty of Engineering, Chulalongkorn University; Siam Quantum Square (SQ2), Faculty of Science, Chulalongkorn University, Bangkok, Thailand"
+    },
+    {
+      "name": "Thanasilp, Supanut",
+      "affiliation": "Chula Intelligent and Complex Systems Center of Excellence, Faculty of Science, Chulalongkorn University; Siam Quantum Square (SQ2), Faculty of Science, Chulalongkorn University, Bangkok, Thailand"
+    },
+    {
+      "name": "Chotibut, Thiparat",
+      "affiliation": "Chula Intelligent and Complex Systems Center of Excellence, Faculty of Science, Chulalongkorn University; Siam Quantum Square (SQ2), Faculty of Science, Chulalongkorn University, Bangkok, Thailand"
+    }
+  ],
+  "keywords": [
+    "quantum computing",
+    "QAOA",
+    "quantum alternating operator ansatz",
+    "constrained optimization",
+    "portfolio optimization",
+    "preserving mixers",
+    "constraint-preserving mixers",
+    "barren plateaus",
+    "CUDA-Q",
+    "genetic algorithm"
+  ],
+  "language": "eng"
+}
