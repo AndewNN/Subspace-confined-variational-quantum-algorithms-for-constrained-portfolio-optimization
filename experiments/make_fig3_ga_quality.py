@@ -1,7 +1,15 @@
-"""Generate Fig. 3 (GA timing & quality) from cached experiment outputs.
+"""Generate Fig. 3 (GA timing & quality).
 
 Run from the experiments/ directory so relative paths to ../dataset/ and
 ./models/ resolve correctly.
+
+The script runs one optimizer (selected by ``OPTIMIZER_IDX`` below, or the
+``SCQAOA_OPTIMIZER_IDX`` environment variable), caches its trace to
+``./output_PO/expectations_<name>.npy``, then plots every cached trace it
+finds. Reproducing the full comparison panel therefore means running it
+once per optimizer index, e.g.
+
+    for i in 0 1 2 3 4; do SCQAOA_OPTIMIZER_IDX=$i python make_fig3_ga_quality.py; done
 """
 
 import numpy as np
@@ -10,6 +18,7 @@ import cudaq
 import matplotlib.pyplot as plt
 import sys
 import os
+from typing import List  # used in the @cudaq.kernel signatures below
 
 import _paths  # noqa: F401
 from Utils.qaoaCUDAQ import (
@@ -26,6 +35,11 @@ from Utils.qaoaCUDAQ import (
 import time
 
 cudaq.set_target("nvidia")
+
+# Fixed seeds so the figure is reproducible run-to-run. cudaq's own RNG
+# drives the 1e6-shot cudaq.sample() below, so it needs seeding too.
+np.random.seed(42)
+cudaq.set_random_seed(42)
 
 # # HAMILTONIAN BY CUDAQ
 
@@ -162,7 +176,9 @@ print(cudaq.draw(kernel_qaoa_X, tt, n_qubit, 1, idx_1_use, coeff_1_use, idx_2_a_
 
 # # Ansatz Architecture
 
-idx = 3
+# Which optimizer to run this invocation; see Utils.qaoaCUDAQ.optimizer_names.
+OPTIMIZER_IDX = int(os.environ.get("SCQAOA_OPTIMIZER_IDX", 3))
+idx = OPTIMIZER_IDX
 layer_count = 5
 
 parameter_count = layer_count * 2

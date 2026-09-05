@@ -11,14 +11,31 @@ dependencies:
   - pandas
   - scipy
   - matplotlib
+  - seaborn            # make_fig2_trainability.py
   - plotly
+  - networkx           # Utils/qaoaCUDAQ.py (imported at module scope)
+  - scikit-learn       # make_fig2_trainability.py (PCA)
   - tqdm
   - joblib
   - jupyter
   - notebook
   - pybind11
+  - setuptools         # ga_solver/setup.py
   - psutil
   - pip:
       - cuda-quantum-cu12
       - torch
       - yfinance
+      - copulas        # make_fig2_trainability.py (GaussianMultivariate)
+
+# ---------------------------------------------------------------------------
+# Version pinning
+# ---------------------------------------------------------------------------
+# The versions above are intentionally unpinned so the environment resolves on
+# a range of CUDA toolkits. For an exactly reproducible environment, export the
+# solved versions from the machine that produced the published results:
+#
+#     conda env export --no-builds > environment.lock.yml
+#
+# and ship that alongside this file. Numerical results depend most on the
+# cuda-quantum-cu12, torch and numpy versions.

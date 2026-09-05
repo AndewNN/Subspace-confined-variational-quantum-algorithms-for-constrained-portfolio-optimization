@@ -1,17 +1,57 @@
 """SC-QAOA approximation-ratio sweep (§07 / §08 of the paper).
 
-For each (asset count, experiment) pair, picks a tickers subset from the
-50-stock universe, builds the QAOA Hamiltonian, and either calls the
-CUDA-Q optimizer or a torch-Adam path with cosine annealing. Optionally
+For each (asset count, experiment, seed) triple, picks a tickers subset from
+the 50-stock universe, builds the QAOA Hamiltonian, and optimizes the
+variational parameters with torch-Adam + cosine annealing. Optionally
 preselects the working subspace via the ga_solver C++ extension.
 
-Boost-factor reference (X mixer, A=6 — preserved from the original docstring):
+Three ansatz modes are supported via ``-m``:
+
+``X``
+    Soft-penalty baseline — the budget constraint enters the cost
+    Hamiltonian as ``λ · H_penalty`` and the mixer is the standard
+    transverse field.
+``Preserving``
+    Subspace-confined QAOA — the mixer confines the dynamics to the
+    low-violation subspace ``S_ε``; there is no ``λ``.
+``Ramp``
+    Linear-Ramp QAOA (LR-QAOA) reference — no optimization at all. The
+    schedule ``γ_i = δγ·(i+1)/p``, ``β_i = δβ·(1 - i/p)`` is evaluated
+    once, giving a training-free baseline for the trainability comparison.
+
+Hamiltonian scaling (``-norm``)
+-------------------------------
+The cost Hamiltonian is rescaled by a *boost* factor before observation.
+Because Adam's step size is fixed, this boost sets the effective gradient
+magnitude — i.e. it acts as a learning-rate scale. Rather than hand-tuning
+one boost per (λ, A) cell, ``-norm`` derives it from the Ising couplings:
+
+    ``J``      boost = 1 / max|J_ij|
+    ``Jh``     boost = 1 / max(max|J_ij|, max|h_i|)     (recommended)
+    ``h``      boost = 1 / max|h_i|
+    ``fixed``  boost = the literal ``-b_X`` / ``-b_P`` / ``-b_R`` value
+
+``-lr_s`` multiplies the derived boost on top. All reported expectation
+values are divided back out by the boost, so results stay comparable
+across normalization modes.
+
+Boost-factor reference for ``-norm fixed`` (X mixer, A=6 — the hand-tuned
+values used before auto-normalization was introduced):
     L=0.5      b_X = 50
     L=0.05     b_X = 250
     L=0.005    b_X = 6875
     L=0.0005   b_X = 17500
     L=0.00005  b_X = 23750
     L=0.000005 b_X = 36875
+
+Outputs
+-------
+Results are written under ``<root>/exp_L<λ>_q<q>/`` as
+``report_<mode>_boost_<norm>.csv`` and a matching ``expectation_*.npz``.
+The root directory name encodes the run configuration (init scheme, LR
+scale, weight decay, normalization mode) so sweeps do not collide. Use
+``-post`` to give a parallel slice its own root and
+``merge_split_results.py`` to stitch the slices back together.
 """
 from __future__ import annotations
 
@@ -38,7 +78,6 @@ from Utils.qaoaCUDAQ import (
     basis_T_to_pauli_parallel,
     find_budget,
     get_init_states,
-    get_optimizer,
     kernel_flipped,
     kernel_qaoa_Preserved,
     kernel_qaoa_X,
@@ -47,6 +86,7 @@ from Utils.qaoaCUDAQ import (
     qubo_to_ising,
     ret_cov_to_QUBO,
     reversed_str_bases_to_init_state,
+    to_sig,
 )
 
 faulthandler.enable()
@@ -59,16 +99,17 @@ if __name__ == "__main__":
     # Assume that already set CUDA_VISIBLE_DEVICES
     device = torch.device("cuda:0")
 
-    report_col = ["Assets", "Exp", "Qubits", "Approximate_ratio", "Return", "Risk", "Budget_Violations", "Budget", "MaxProb_ratio", "init_1_time", "init_2_time", "optim_time", "epochs", "observe_time"]
+    report_col = ["Assets", "Layer", "Exp", "Seed", "Qubits", "Boost", "Approximate_ratio", "Prob_Optimal", "Return", "Risk", "Budget_Violations", "Budget", "MaxProb_ratio", "init_1_time", "init_2_time", "optim_time", "epochs", "observe_time"]
 
     TARGET_QUBIT_IN = 3
     TARGET_ASSET = [3, 4, 5, 6, 7]
     # min_P, max_P = 95, 190
     min_P, max_P = 108, 216
     # min_P, max_P = 200, 400
-    hamiltonian_X_boost = 7500.0
-    hamiltonian_P_boost = 7500.0
-    modes = ["X", "Preserving"]
+    hamiltonian_X_boost = 0.0
+    hamiltonian_R_boost = 0.0
+    hamiltonian_P_boost = 0.0
+    modes = ["X", "Preserving", "Ramp"]
     eps = [0.1]
     SHIFT = 1e-4
     F_TOL = 1e-4
@@ -126,11 +167,25 @@ if __name__ == "__main__":
             help="Number of QAOA layers (int)"
         )
 
-        # select mode in ["X", "Preserving"]
+        # select mode in ["X", "Preserving", "Ramp"]
         parser.add_argument(
             "-m", "--mode",
             type=str, default="X",
-            help="Mode selection in ['X', 'Preserving']"
+            help="Mode selection in ['X', 'Preserving', 'Ramp']"
+        )
+
+        # delta_beta of LR-QAOA
+        parser.add_argument(
+            "-d_b", "--delta_beta",
+            type=float, default=0.3,
+            help="Delta beta for LR-QAOA (float)"
+        )
+
+        # delta_gamma of LR-QAOA
+        parser.add_argument(
+            "-d_g", "--delta_gamma",
+            type=float, default=0.6,
+            help="Delta gamma for LR-QAOA (float)"
         )
 
         # number of preserving bases
@@ -154,11 +209,25 @@ if __name__ == "__main__":
             help="Hamiltonian boost for X mixer (float)"
         )
 
+        # Hamiltonian boost for LR-QAOA
+        parser.add_argument(
+            "-b_R", "--ham_boost_R",
+            type=float, default=hamiltonian_R_boost,
+            help="Hamiltonian boost for LR-QAOA (float)"
+        )
+
         # Hamiltonian boost for Preserving mixer
         parser.add_argument(
             "-b_P", "--ham_boost_P",
             type=float, default=hamiltonian_P_boost,
             help="Hamiltonian boost for Preserving mixer (float)"
+        )
+
+        # Learning rate scaling
+        parser.add_argument(
+            "-lr_s", "--learning_rate_scale",
+            type=float, default=1.0,
+            help="Forced learning rate scaling for optimizer (float)"
         )
 
         # epsilon for budget feasible set for each Asset
@@ -168,25 +237,32 @@ if __name__ == "__main__":
             help="List of epsilon for budget feasible set for each Asset, e.g. -eps 0.1 0.2"
         )
 
+        # Weight_decay of optimizer
+        parser.add_argument(
+            "-wd", "--weight_decay",
+            type=float, default=0.0,
+            help="Weight decay for optimizer (float)"
+        )
+
         # disable progress bar
         parser.add_argument(
             "--no_pbar",
             action="store_true", default=False,
-            help="Use tqdm progress bar (bool) e.g. --pbar True or --pbar False"
+            help="Use tqdm progress bar (bool)"
         )
 
         # disable create directory
         parser.add_argument(
             "--no_dir",
             action="store_true", default=False,
-            help="Disable create directory (bool) e.g. --no_dir True or --no_dir False"
+            help="Disable create directory (bool) e.g. --no_dir"
         )
 
-        # optim by pytorch
+        # Normalize the Hamiltonian boost automatically
         parser.add_argument(
-            "--torch_optim",
-            action="store_true", default=False,
-            help="Use pytorch optimizer (bool) e.g. --torch_optim True or --torch_optim False"
+            "--normalize_hamiltonian", "-norm",
+            type=str, default="fixed",
+            help="Normalize the Hamiltonian boost automatically (accept 'J', 'Jh', 'h', 'fixed') e.g. -norm Jh"
         )
 
         # Overwrite old results rather than skipping
@@ -214,7 +290,14 @@ if __name__ == "__main__":
         parser.add_argument(
             "--random_init",
             action="store_true", default=False,
-            help="Use random initialization (bool) e.g. --random_init True or --random_init False"
+            help="Use random initialization (bool) e.g. --random_init"
+        )
+
+        # Linear Ramp init
+        parser.add_argument(
+            "--LR_init",
+            action="store_true", default=False,
+            help="Use Linear Ramp initialization (bool) e.g. --LR_init"
         )
 
         # GA debug
@@ -245,6 +328,34 @@ if __name__ == "__main__":
             help="Use best bases for Preserving mixer"
         )
 
+        # n_seed for number of seeds to run
+        parser.add_argument(
+            "--n_seed", "-seed",
+            type=int, default=1,
+            help="Number of seeds to run for each experiment setting (int)"
+        )
+
+        # forced root dir name
+        parser.add_argument(
+            "--root_dir", "-root",
+            type=str, default=None,
+            help="Forced root directory name for reading/writing results (str)"
+        )
+
+        # run only specific experiment points
+        parser.add_argument(
+            "--exp_list", "-e_list",
+            nargs="+", type=int, default=None,
+            help="Explicit list of experiment indices to run (overrides -E/-E_st), e.g. -e_list 0 3 7"
+        )
+
+        # postfix appended to root directory name (for parallel split runs)
+        parser.add_argument(
+            "--dir_postfix", "-post",
+            type=str, default="",
+            help="Postfix appended to root directory name (results go to <root>_<postfix>), e.g. -post job1"
+        )
+
         return parser.parse_args()
 
     args = parse_args()
@@ -259,23 +370,33 @@ if __name__ == "__main__":
     # Z = args.basis
     E = args.exp
     E_st = args.exp_start
+    exp_points = args.exp_list if args.exp_list is not None else list(range(E_st, E))
     mode = args.mode
     num_init_bases = args.bases
-    fd = cudaq.gradients.ForwardDifference()
+    n_seed = args.n_seed
     SHIFT = args.shift
     hamiltonian_X_boost = args.ham_boost_X
+    hamiltonian_R_boost = args.ham_boost_R
     hamiltonian_P_boost = args.ham_boost_P
     eps = args.epsilon
     is_pbar = not args.no_pbar
     is_dir = not args.no_dir
-    is_torch_optim = args.torch_optim
+    root_dir = args.root_dir
+    auto_boost_mode = args.normalize_hamiltonian
+    assert auto_boost_mode in ["J", "Jh", "h", "fixed"]
+
     OVERWRITE = args.OVERWRITE
     F_TOL = args.f_tol
+    WEIGHT_DECAY = args.weight_decay
     random_init = args.random_init
+    is_LR_init = args.LR_init
     DEBUG_GA = args.DEBUG_GA
     DUPLICATE_ASSET = args.DUPLICATE_ASSET
     DEBUG_BF = args.DEBUG_BF
     BEST_BASES = args.BEST_BASES
+    delta_beta = args.delta_beta
+    delta_gamma = args.delta_gamma
+    learning_rate_scale = args.learning_rate_scale
 
     is_GA = args.GA
     population_size = 2000
@@ -286,33 +407,36 @@ if __name__ == "__main__":
 
     hamiltonian_P_boost = hamiltonian_P_boost if not hamiltonian_P_boost.is_integer() else int(hamiltonian_P_boost)
     hamiltonian_X_boost = hamiltonian_X_boost if not hamiltonian_X_boost.is_integer() else int(hamiltonian_X_boost)
+    hamiltonian_R_boost = hamiltonian_R_boost if not hamiltonian_R_boost.is_integer() else int(hamiltonian_R_boost)
+    WEIGHT_DECAY = WEIGHT_DECAY if not WEIGHT_DECAY.is_integer() else int(WEIGHT_DECAY)
 
-    LAMB = LAMB if mode == "X" else 1.0
+    LAMB = LAMB if mode in ["X", "Ramp"] else 1.0
     assert mode in modes, f"Mode {mode} not in {modes}"
     assert len(eps) == 1 or len(eps) == len(TARGET_ASSET), "Length of eps must be 1 or equal to length of TARGET_ASSET"
     if len(eps) == 1:
         eps = eps * len(TARGET_ASSET)
     eps = np.array(eps)
 
-    # s_a, s_b = a.get_pauli_word(), b.get_pauli_word()
-    # c_a, c_b = a.evaluate_coefficient().real, b.evaluate_coefficient().real
-
     # Dataset (filtered to the [min_P, max_P] price band)
     data_ret_p_pd, data_cov_pd = load_universe(min_P, max_P)
 
-    # experiments_approx_Q3/exp_p5_L0.001_q1\
-    #                                        |- report_X_boost_1.csv
-    #                                        |- report_Preserving_12_boost_2000.csv
-    #                                        |- report_Preserving_24_boost_2000.csv
-    #                                        |- expectation_X_boost_1.npz [A * E, #optim_loops(varies), 2 * LAYER]
-    #                                        |- expectation_Preserving_12_boost_2000.npz [A * E, #optim_loops(varies)]
-    #                                        |- expectation_Preserving_24_boost_2000.npz [A * E, #optim_loops(varies)]
+    # <root>/exp_L0.001_q1\
+    #                      |- report_X_boost_Jh.csv
+    #                      |- report_Preserving12_boost_Jh.csv
+    #                      |- report_Ramp0.3_0.6_boost_Jh.csv
+    #                      |- expectation_X_boost_Jh.npz
+    #                      |- expectation_Preserving12_boost_Jh.npz
+    #                      |- expectation_Ramp0.3_0.6_boost_Jh.npz
 
     f_Q = Q if not Q.is_integer() else int(Q)
     f_LAMB = LAMB if not LAMB.is_integer() else int(LAMB)
-    dir_name = f"exp_p{LAYER}_L{f_LAMB}_q{f_Q}{'_torch' if is_torch_optim else ''}"
-    dir_path = f"./experiments_approx_Q{TARGET_QUBIT_IN}{'_RAND' if random_init else ''}{'_bestbases' if BEST_BASES else ''}/{dir_name}"
-    file_postfix = f"{mode}{'' if mode == 'X' else str(num_init_bases)}_boost_{hamiltonian_P_boost if mode == 'Preserving' else hamiltonian_X_boost}"
+    dir_name = f"exp_L{f_LAMB}_q{f_Q}"
+    root_name = root_dir if root_dir is not None else f"experiments_approx_Q{TARGET_QUBIT_IN}{'_RAND' if random_init else f'_LR_{delta_beta}_{delta_gamma}' if is_LR_init else ''}{'_bestbases' if BEST_BASES else ''}_S{learning_rate_scale}_W{WEIGHT_DECAY}_{auto_boost_mode}"
+    if args.dir_postfix:
+        root_name = f"{root_name}_{args.dir_postfix}"
+    dir_path = f"{root_name}/{dir_name}"
+    print(f"Results will be saved in: {dir_path}")
+    file_postfix = f"{mode}{'' if mode == 'X' else str(delta_beta)+'_'+str(delta_gamma) if mode == 'Ramp' else str(num_init_bases)}_boost_{auto_boost_mode}"
     file_postfix += ("_GA" if mode == "Preserving" and is_GA else "")
     report_name = f"report_{file_postfix}.csv"
     expect_name = f"expectation_{file_postfix}.npz"
@@ -320,31 +444,19 @@ if __name__ == "__main__":
     if is_dir:
         os.makedirs(dir_path, exist_ok=True)
 
-    print(f"Experiments: {E}, Qubits/Asset: {TARGET_QUBIT_IN}, Assets: {TARGET_ASSET}, epsilon: {eps.tolist()}, Lambda: {LAMB}, q: {Q}, Layers: {LAYER}, mode: {mode}{f', num_init_bases: {num_init_bases}' if mode == 'Preserving' else ''}, GA: {is_GA}, boost: {hamiltonian_X_boost if mode == 'X' else hamiltonian_P_boost}")
-    # if is_pbar:
-    # # for i, N_ASSETS in enumerate(pbar_A):
+    print(f"Experiments: {E}, Qubits/Asset: {TARGET_QUBIT_IN}, Assets: {TARGET_ASSET}, epsilon: {eps.tolist()}, Lambda: {LAMB}, q: {Q}, Layers: {LAYER}, mode: {mode}{f', num_init_bases: {num_init_bases}' if mode == 'Preserving' else ''}, GA: {is_GA}, boost: {hamiltonian_X_boost if mode == 'X' else hamiltonian_P_boost if mode == 'Preserving' else hamiltonian_R_boost}, learning_rate_scale: {learning_rate_scale}, weight_decay: {WEIGHT_DECAY}")
     pbar_A = tqdm(TARGET_ASSET, disable=not is_pbar)
     for idx_asset, N_ASSETS in enumerate(pbar_A):
         if is_pbar:
             pbar_A.set_description(f"Assets {N_ASSETS}")
-        # for e in (range(E_st, E) if not is_pbar else pbar_exp):
-        pbar_exp = tqdm(range(E_st, E), leave=False, disable=not is_pbar)
+        pbar_exp = tqdm(exp_points, leave=False, disable=not is_pbar)
         for e in pbar_exp:
-            df_now = pd.read_csv(f"{dir_path}/{report_name}") if os.path.exists(f"{dir_path}/{report_name}") else None
-            if df_now is not None:
-                if not OVERWRITE and df_now[(df_now["Assets"] == N_ASSETS) & (df_now["Exp"] == e)].shape[0] > 0:
-                    continue
-            else :
-                df_now = pd.DataFrame(columns=report_col)
-
             if is_pbar:
                 pbar_exp.set_description("init_1 ")
             st = time.time()
             np.random.seed(911 + 991 * e + 997 * N_ASSETS)
             state = np.random.get_state()
-            # asset_idx = np.random.choice(data_cov_pd.shape[0], max(TARGET_ASSET), replace=False)
             asset_idx = np.random.choice(data_cov_pd.shape[0], N_ASSETS, replace=DUPLICATE_ASSET)
-            # asset_idx = np.array([0, 18, 27, 32, 41])
             data_cov = data_cov_pd.drop("Ticker", axis=1).to_numpy()[asset_idx, :][:, asset_idx]
             stock_names = data_ret_p_pd["Company_Name"].to_numpy()[asset_idx]
             data_ret_p = data_ret_p_pd.drop("Ticker", axis=1)
@@ -354,23 +466,15 @@ if __name__ == "__main__":
             data_ret = data_ret_p[:, 0]
             data_p = data_ret_p[:, 1]
 
-            if os.path.exists(f"{dir_path}/{expect_name}"):
-                curr_expect = np.load(f"{dir_path}/{expect_name}")
-            else:
-                curr_expect = {}
-            curr_expect = dict(curr_expect)
-            curr_expect[f'A{N_ASSETS}_E{e}_P'] = data_p
-            curr_expect[f'A{N_ASSETS}_E{e}_ret'] = data_ret
-            curr_expect[f'A{N_ASSETS}_E{e}_cov'] = data_cov
-            curr_expect[f'A{N_ASSETS}_E{e}_idx'] = asset_idx_raw
-            np.savez_compressed(f"{dir_path}/{expect_name}", **curr_expect)
-
             np.random.set_state(state)
             weighted = np.random.uniform(0, 1)
             B_mi, B_ma = find_budget(TARGET_QUBIT_IN * N_ASSETS, data_p, min_P, max_P, min_mix_mode=True)
             B = B_mi * weighted + B_ma * (1 - weighted)
 
             mean12_eps_GA, mean24_eps_GA = 0, 0
+            min12_eps_GA, min24_eps_GA = float('inf'), float('inf')
+            max12_eps_GA, max24_eps_GA = 0, 0
+
             if is_GA:
                 mutation_rate = 1.5 / (N_ASSETS * TARGET_QUBIT_IN)
                 ga = ga_solver.GeneticAlgorithm(
@@ -381,7 +485,10 @@ if __name__ == "__main__":
                     mutation_rate=mutation_rate,
                     crossover_rate=crossover_rate,
                     elitism_count=elitism_count,
-                    tournament_size=tournament_size
+                    tournament_size=tournament_size,
+                    # Deterministic per (experiment, asset count) so the GA-selected
+                    # subspace is reproducible across runs and machines.
+                    seed=919 + 991 * e + 997 * N_ASSETS
                 )
                 st_GA = time.perf_counter()
                 ga.run(generations, verbose=False)
@@ -402,15 +509,22 @@ if __name__ == "__main__":
 
                     ## -------------
 
-                    col_GA = ["Assets", "GA_time_ms", "BF_time_ms", "mean12_eps_GA", "mean24_eps_GA", "mean12_eps_BF", "mean24_eps_BF"]
+                    col_GA = ["Assets", "GA_time_ms", "BF_time_ms",
+                              "mean12_eps_GA", "min12_eps_GA", "max12_eps_GA",
+                              "mean24_eps_GA", "min24_eps_GA", "max24_eps_GA",
+                              "mean12_eps_BF", "min12_eps_BF", "max12_eps_BF",
+                              "mean24_eps_BF", "min24_eps_BF", "max24_eps_BF"]
 
                     all_diff_ga, all_diff_bf = 0, 0
+                    min12_eps_GA, min24_eps_GA = float('inf'), float('inf')
+                    max12_eps_GA, max24_eps_GA = 0, 0
                     list_diff_ga = []
                     list_chrom_ga = []
                     for i in range(12):
                         budd = top_inv[i].total_cost
-                        all_diff_ga += np.abs(budd - B) / B
-                        list_diff_ga.append(np.abs(budd - B) / B)
+                        diff_ga = np.abs(budd - B) / B
+                        all_diff_ga += diff_ga
+                        list_diff_ga.append(diff_ga)
                         list_chrom_ga.append(top_inv[i].chromosome)
                     mean12_eps_GA = all_diff_ga / 12
                     mean12_eps_BF = all_diff_bf / 12
@@ -418,11 +532,16 @@ if __name__ == "__main__":
                     if num_init_bases >= 24:
                         for i in range(12, 24):
                             budd = top_inv[i].total_cost
-                            all_diff_ga += np.abs(budd - B) / B
-                            list_diff_ga.append(np.abs(budd - B) / B)
+                            diff_ga = np.abs(budd - B) / B
+                            all_diff_ga += diff_ga
+                            list_diff_ga.append(diff_ga)
                             list_chrom_ga.append(top_inv[i].chromosome)
                     mean24_eps_GA = all_diff_ga / 24
                     mean24_eps_BF = all_diff_bf / 24
+                    min12_eps_GA = min(list_diff_ga[:12])
+                    max12_eps_GA = max(list_diff_ga[:12])
+                    min24_eps_GA = min(list_diff_ga[:24])
+                    max24_eps_GA = max(list_diff_ga[:24])
 
             P = data_p[:N_ASSETS]
             ret = data_ret[:N_ASSETS]
@@ -430,7 +549,7 @@ if __name__ == "__main__":
 
             q = Q
             lamb = LAMB
-            hamiltonian_boost = (hamiltonian_X_boost if mode == "X" else hamiltonian_P_boost)
+            hamiltonian_boost = (hamiltonian_X_boost if mode == "X" else hamiltonian_R_boost if mode == "Ramp" else hamiltonian_P_boost)
             if DEBUG_GA ^ (not DEBUG_BF):
                 P_bb, ret_bb, cov_bb, n_qubit, n_max, C = po_normalize(B, P, ret, cov)
                 QU_lamb = ret_cov_to_QUBO(np.zeros_like(ret_bb), np.zeros_like(cov_bb), P_bb, lamb, 0.0)
@@ -443,12 +562,59 @@ if __name__ == "__main__":
                 QU_return = ret_cov_to_QUBO(ret_bb, np.zeros_like(cov_bb), np.zeros_like(P_bb), 0.0, 0.0)
                 QU_risk = ret_cov_to_QUBO(np.zeros_like(ret_bb), cov_bb, np.zeros_like(P_bb), 0.0, q)
 
-                # Hamiltonians of MIN PROBLEM
-                H_ansatz = -qubo_to_ising(*((QU, lamb) if mode == "X" else (QU_eval, 0.0))).canonicalize() * hamiltonian_boost
-                H_lamb = -qubo_to_ising(QU_lamb, lamb).canonicalize() * hamiltonian_boost
-                H_eval = -qubo_to_ising(QU_eval, 0.0).canonicalize() * hamiltonian_boost
-                H_return = -qubo_to_ising(QU_return, 0.0).canonicalize() * hamiltonian_boost
-                H_risk = -qubo_to_ising(QU_risk, 0.0).canonicalize() * hamiltonian_boost
+                # Hamiltonians of MIN PROBLEM (un-boosted — the boost is derived below)
+                H_ansatz = -qubo_to_ising(*((QU, lamb) if mode in ["X", "Ramp"] else (QU_eval, 0.0))).canonicalize()
+                H_lamb = -qubo_to_ising(QU_lamb, lamb).canonicalize()
+                H_eval = -qubo_to_ising(QU_eval, 0.0).canonicalize()
+                H_return = -qubo_to_ising(QU_return, 0.0).canonicalize()
+                H_risk = -qubo_to_ising(QU_risk, 0.0).canonicalize()
+
+                # The circuit gates use the raw (un-boosted) Ising couplings; the
+                # boost applies only to the observed Hamiltonians, where it sets
+                # the gradient scale seen by Adam.
+                idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use = process_ansatz_values(H_ansatz)
+                coeff_1_use, coeff_2_use = np.array(coeff_1_use), np.array(coeff_2_use)
+                max_J = np.max(np.abs(coeff_2_use))
+                max_h = np.max(np.abs(coeff_1_use))
+                max_J_h = max(max_J, max_h)
+                use_norm = (max_J if auto_boost_mode == "J" else max_J_h if auto_boost_mode == "Jh" else max_h if auto_boost_mode == "h" else 1.0)
+                hamiltonian_boost = 1 / use_norm if auto_boost_mode != "fixed" else hamiltonian_boost
+                hamiltonian_boost = hamiltonian_boost * learning_rate_scale
+                hamiltonian_boost = to_sig(hamiltonian_boost, 4)
+
+                H_ansatz = H_ansatz * hamiltonian_boost
+                H_lamb = H_lamb * hamiltonian_boost
+                H_eval = H_eval * hamiltonian_boost
+                H_return = H_return * hamiltonian_boost
+                H_risk = H_risk * hamiltonian_boost
+
+            # Skip this (Assets, Layer, Exp, Boost) cell only if every seed is
+            # already on disk — the boost is part of the key, so it has to be
+            # resolved (above) before the check can run.
+            df_now = pd.read_csv(f"{dir_path}/{report_name}") if os.path.exists(f"{dir_path}/{report_name}") else None
+            if df_now is not None:
+                ch_exist = 1
+                for i_s in range(n_seed):
+                    if not OVERWRITE and df_now[(df_now["Assets"] == N_ASSETS) & (df_now["Layer"] == LAYER) & (df_now["Exp"] == e) & (df_now["Seed"] == i_s) & (df_now["Boost"] == hamiltonian_boost)].shape[0] > 0:
+                        continue
+                    else:
+                        ch_exist = 0
+                        break
+                if ch_exist == 1:
+                    continue
+            else :
+                df_now = pd.DataFrame(columns=report_col)
+
+            if os.path.exists(f"{dir_path}/{expect_name}"):
+                curr_expect = np.load(f"{dir_path}/{expect_name}")
+            else:
+                curr_expect = {}
+            curr_expect = dict(curr_expect)
+            curr_expect[f'A{N_ASSETS}_E{e}_P'] = data_p
+            curr_expect[f'A{N_ASSETS}_E{e}_ret'] = data_ret
+            curr_expect[f'A{N_ASSETS}_E{e}_cov'] = data_cov
+            curr_expect[f'A{N_ASSETS}_E{e}_idx'] = asset_idx_raw
+            np.savez_compressed(f"{dir_path}/{expect_name}", **curr_expect)
 
             # state_return = all_state_to_return(n_qubit, lamb, QU)
             if DEBUG_GA ^ (not DEBUG_BF):
@@ -460,19 +626,28 @@ if __name__ == "__main__":
                 state_penalty_s = np.sort(state_penalty)
                 mean12_eps_BF = np.sqrt(state_penalty_s[:12] / lamb).mean()
                 mean24_eps_BF = np.sqrt(state_penalty_s[:24] / lamb).mean()
-            # for i in range(24):
-            #     gaa = list_diff_ga[i]
-            #     bff = np.sqrt(state_penalty_s[i] / lamb)
-            
+                min12_eps_BF = np.sqrt(state_penalty_s[0] / lamb)
+                max12_eps_BF = np.sqrt(state_penalty_s[11] / lamb)
+                min24_eps_BF = np.sqrt(state_penalty_s[0] / lamb)
+                max24_eps_BF = np.sqrt(state_penalty_s[23] / lamb)
+
             df_speed = (pd.read_csv("./speed.csv") if os.path.exists("./speed.csv") else pd.DataFrame(columns=["Assets", "GA_time_ms", "BF_time_ms", "mean12_eps_GA", "mean24_eps_GA", "mean12_eps_BF", "mean24_eps_BF"]))
             new_row_speed = {
                 "Assets": N_ASSETS,
                 "GA_time_ms": (time_GA * 1000) if is_GA else np.nan,
                 "BF_time_ms": time_BF * 1000 if (is_GA and DEBUG_BF) else np.nan,
                 "mean12_eps_GA": mean12_eps_GA if (is_GA and DEBUG_GA) else np.nan,
+                "min12_eps_GA": min12_eps_GA if (is_GA and DEBUG_GA) else np.nan,
+                "max12_eps_GA": max12_eps_GA if (is_GA and DEBUG_GA) else np.nan,
                 "mean24_eps_GA": mean24_eps_GA if (is_GA and DEBUG_GA) else np.nan,
+                "min24_eps_GA": min24_eps_GA if (is_GA and DEBUG_GA) else np.nan,
+                "max24_eps_GA": max24_eps_GA if (is_GA and DEBUG_GA) else np.nan,
                 "mean12_eps_BF": mean12_eps_BF if (is_GA and DEBUG_BF) else np.nan,
-                "mean24_eps_BF": mean24_eps_BF if (is_GA and DEBUG_BF) else np.nan
+                "min12_eps_BF": min12_eps_BF if (is_GA and DEBUG_BF) else np.nan,
+                "max12_eps_BF": max12_eps_BF if (is_GA and DEBUG_BF) else np.nan,
+                "mean24_eps_BF": mean24_eps_BF if (is_GA and DEBUG_BF) else np.nan,
+                "min24_eps_BF": min24_eps_BF if (is_GA and DEBUG_BF) else np.nan,
+                "max24_eps_BF": max24_eps_BF if (is_GA and DEBUG_BF) else np.nan
             }
             if is_GA and DEBUG_GA:
                 if os.path.exists("./speed.csv"):
@@ -483,29 +658,25 @@ if __name__ == "__main__":
                 continue
 
             state_eval = all_state_to_return(n_qubit, 0.0, QU_eval)
-
-            # state_optim = -all_state_to_return(n_qubit, *((lamb, QU) if mode == "X" else (0.0, QU_eval)))
-            # # print(best_vall)
+            idx_optimal = np.argsort(state_eval)[-1]
 
             # |P^t x -1| <= eps
             # lamb (P^t x -1)^2 <= lamb * eps^2
-            eps_t = (eps[idx_asset]) ** 2
+            eps_t = lamb * (eps[idx_asset]) ** 2
             idx_feasible = np.where(np.abs(state_penalty) <= eps_t)
 
             # direct compute
-            
+
             init_1_time = time.time() - st
 
             if is_pbar:
                 pbar_exp.set_description("init_2 ")
             st = time.time()
-            idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use = process_ansatz_values(H_ansatz)
-            coeff_1_use, coeff_2_use = np.array(coeff_1_use), np.array(coeff_2_use)
-            kernel_qaoa_use = kernel_qaoa_X if mode == "X" else kernel_qaoa_Preserved
+            kernel_qaoa_use = kernel_qaoa_X if mode in ["X", "Ramp"] else kernel_qaoa_Preserved
             layer_count = LAYER
             parameter_count = layer_count * 2
 
-            if mode == "X":
+            if mode != "Preserving":
                 ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use)
             else:
                 # init_state = get_init_states(state_return, num_init_bases, n_qubit)
@@ -516,10 +687,7 @@ if __name__ == "__main__":
                         init_state = get_init_states(-state_eval, num_init_bases, n_qubit, idx_feasible[0])
                     else:
                         init_state = get_init_states(state_penalty, num_init_bases, n_qubit)
-                    
-                # # print(init_state[num_init_bases-1], P_bb)
-                # uuu = np.array([int(e) for e in init_state[num_init_bases-1]])
-                # idxx = np.argsort(state_penalty)
+
                 n_bases = len(init_state)
                 T = np.zeros((n_bases, n_bases), dtype=np.float32)
                 T[:-1, 1:] += np.eye(n_bases - 1, dtype=np.float32)
@@ -528,8 +696,6 @@ if __name__ == "__main__":
                 st_pauli = time.time()
                 # mixer_s, mixer_c = basis_T_to_pauli(init_state, T, n_qubit)
                 mixer_s, mixer_c = basis_T_to_pauli_parallel(init_state, T, n_qubit)
-                # mixer_s = mixer_s[:250000]
-                # mixer_c = mixer_c[:250000]
                 init_bases = reversed_str_bases_to_init_state(init_state, n_qubit)
 
                 ansatz_fixed_param = (int(n_qubit), layer_count, idx_1_use, coeff_1_use, idx_2_a_use, idx_2_b_use, coeff_2_use, mixer_s, mixer_c, init_bases)
@@ -541,142 +707,127 @@ if __name__ == "__main__":
                 mm_p = np.min(np.abs(mixer_c)) if len(mixer_c) > 0 else 1e9
             mm_i = np.pi / min(mm_1, mm_2, mm_p)
 
-            idx = 3
-            if not is_torch_optim:
-                optimizer, optimizer_name, FIND_GRAD = get_optimizer(idx)
-                optimizer.max_iterations = 300
-            np.random.seed(4001 + 4099 * e + 4999 * N_ASSETS)
-            points = np.random.uniform(-1, 1, (parameter_count))
-            points[::2] *= mm_i
-            points[1::2] *= np.pi
+            pbar_seed = tqdm(range(n_seed), leave=False, disable=not is_pbar)
+            for i_s in pbar_seed:
+                if not OVERWRITE and df_now[(df_now["Assets"] == N_ASSETS) & (df_now["Layer"] == LAYER) & (df_now["Exp"] == e) & (df_now["Seed"] == i_s) & (df_now["Boost"] == hamiltonian_boost)].shape[0] > 0:
+                    continue
 
-            # result = cudaq.get_state(kernel_qaoa_use, points, *ansatz_fixed_param)
-            # prob = np.abs(result)**2
+                init_2_time = time.time() - st
 
-            if is_torch_optim:
-                max_iter = 300
-                if random_init:
-                    points_cu = torch.tensor(points, dtype=torch.float64, device=device)
-                else:
-                    points_cu = torch.tensor(np.zeros_like(points), dtype=torch.float64, device=device)
+                if is_pbar:
+                    pbar_exp.set_description(f"optim (e={e}, SEED={i_s}, Boost={hamiltonian_boost}) ")
+                st = time.time()
+                num_iter = 0
+                last_f = None
+                cou_con = 0
+                expectations = []
 
-                optimizer_cu = Adam([points_cu], lr=0.01, betas=(0.95, 0.98), weight_decay=0.01, decoupled_weight_decay=True)
+                if mode != "Ramp":
+                    np.random.seed(4001 + 4099 * e + 4999 * N_ASSETS + 5099 * i_s)
+                    points = np.random.uniform(-1, 1, (parameter_count))
+                    # parameters are laid out as [γ_0..γ_{p-1}, β_0..β_{p-1}]
+                    points[:layer_count] *= mm_i
+                    points[layer_count:] *= np.pi
 
-                scheduler_all = CosineAnnealingLR(optimizer_cu, T_max=max_iter, eta_min=0.0003)
-                FIND_GRAD = True
-
-            init_2_time = time.time() - st
-
-            if is_pbar:
-                pbar_exp.set_description("optim  ")
-            st = time.time()
-            num_iter = 0
-            last_f = None
-            cou_con = 0
-            expectations = []
-            if not is_torch_optim:
-                def cost_func(parameters, cal_expectation=False):
-                    exp_return = float(cudaq.observe(kernel_qaoa_use, H_ansatz, parameters, *ansatz_fixed_param).expectation())
-                    if cal_expectation:
-                        #     raise cudaq.optimization.StopOptimization("Converged")
-                        num_iter += 1
-                        exp_return_eval = float(cudaq.observe(kernel_qaoa_use, H_eval, parameters, *ansatz_fixed_param).expectation())
-                        exp_return_lamb = float(cudaq.observe(kernel_qaoa_use, H_lamb, parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
-                        exp_return_violate = sqrt(exp_return_lamb / lamb)
-                        expectations.append([exp_return / hamiltonian_boost, exp_return_eval / hamiltonian_boost, exp_return_lamb, parameters[0], parameters[1]])
-                    return exp_return
-
-                def objective(parameters):
-                    expectation = cost_func(parameters, cal_expectation=True)
-                    return expectation
-                
-                def objective_grad_cuda(parameters):
-                    expectation = cost_func(parameters, cal_expectation=True)
-                    gradient = fd.compute(parameters, cost_func, expectation)
-                    return expectation, gradient
-                
-                objective_func = objective_grad_cuda if FIND_GRAD else objective
-
-                # optimizer.initial_parameters = points
-                optimizer.initial_parameters = np.zeros_like(points)
-                optimal_expectation, optimal_parameters = optimizer.optimize(
-                    dimensions=parameter_count, function=objective_func)
-            
-            if is_torch_optim:
-                optimal_expectation, optimal_parameters = None, None
-                # if is_pbar:
-                pbar_optim = tqdm(range(max_iter), leave=False, disable=not is_pbar)
-                for it in pbar_optim:
-                    optimizer_cu.zero_grad()
-                    params = points_cu.detach().clone()
-                    expectation = float(cudaq.observe(kernel_qaoa_use, H_ansatz, params.cpu().numpy(), *ansatz_fixed_param).expectation())
-                    num_iter += 1
-                    if mode == "X":
-                        expectation_eval = float(cudaq.observe(kernel_qaoa_use, H_eval, params.cpu().numpy(), *ansatz_fixed_param).expectation())
+                    max_iter = 300
+                    if random_init:
+                        points_cu = torch.tensor(points, dtype=torch.float64, device=device)
+                    elif is_LR_init:
+                        points_cu = torch.tensor(np.zeros_like(points), dtype=torch.float64, device=device)
+                        for itt in range(layer_count):
+                            points_cu[itt] = delta_gamma * (itt+1) / layer_count
+                            points_cu[layer_count + itt] = delta_beta * (1 - itt/layer_count)
                     else:
-                        expectation_eval = expectation
-                    expectation_lamb = float(cudaq.observe(kernel_qaoa_use, H_lamb, params.cpu().numpy(), *ansatz_fixed_param).expectation()) / hamiltonian_boost
-                    expectation_violate = sqrt(expectation_lamb / lamb)
-                    grad = torch.zeros_like(params)
-                    for j in range(parameter_count):
-                        shift = np.zeros(parameter_count)
-                        shift[j] = SHIFT
-                        forward = float(cudaq.observe(kernel_qaoa_use, H_ansatz, (params.cpu().numpy() + shift), *ansatz_fixed_param).expectation())
-                        grad[j] = (forward - expectation) / SHIFT
-                    points_cu.grad = grad
-                    optimizer_cu.step()
-                    scheduler_all.step()
-                    expectations.append([expectation/hamiltonian_boost, expectation_eval/hamiltonian_boost, expectation_lamb, points_cu[0].item(), points_cu[1].item()])
-                    
-                    cou_con = cou_con + 1 if last_f is not None and abs(expectation - last_f) < F_TOL else 0
-                    if cou_con >= 3:
-                        break
-                    last_f = expectation
-                    
-                    if is_pbar:
-                        pbar_optim.set_description(f"Iter {it}, Exp_obj {expectation/hamiltonian_boost:.6f}, Exp_eval {expectation_eval/hamiltonian_boost:.6f}, Exp_lamb {expectation_lamb:.6f}, LR {optimizer_cu.param_groups[0]['lr']:.4f}")
-                optimal_parameters = points_cu.cpu().numpy()
-            if os.path.exists(f"{dir_path}/{expect_name}"):
-                curr_expect = np.load(f"{dir_path}/{expect_name}")
-            else:
-                curr_expect = {}
-            curr_expect = dict(curr_expect)
-            curr_expect[f'A{N_ASSETS}_E{e}'] = np.array(expectations)
-            curr_expect[f'A{N_ASSETS}_E{e}_params'] = np.array(optimal_parameters)
-            np.savez_compressed(f"{dir_path}/{expect_name}", **curr_expect)
-            optim_time = time.time() - st
+                        points_cu = torch.tensor(np.zeros_like(points), dtype=torch.float64, device=device)
 
-            if is_pbar:
-                pbar_exp.set_description("observe")
-            st = time.time()
-            result = cudaq.get_state(kernel_qaoa_use, optimal_parameters, *ansatz_fixed_param)
-            idx_r_best = np.argmax(np.abs(result))
-            idx_best = bin(idx_r_best)[2:].zfill(n_qubit)[::-1]
+                    optimizer_cu = Adam([points_cu], lr=0.01, betas=(0.95, 0.98), weight_decay=WEIGHT_DECAY, decoupled_weight_decay=True)
+                    scheduler_all = CosineAnnealingLR(optimizer_cu, T_max=max_iter, eta_min=0.0003)
+                    FIND_GRAD = True
 
-            result_r = cudaq.get_state(kernel_flipped, result, TARGET_QUBIT)
-            prob = np.abs(result_r)**2
+                    optimal_expectation, optimal_parameters = None, None
+                    pbar_optim = tqdm(range(max_iter), leave=False, disable=not is_pbar)
+                    for it in pbar_optim:
+                        optimizer_cu.zero_grad()
+                        params = points_cu.detach().clone()
+                        expectation = float(cudaq.observe(kernel_qaoa_use, H_ansatz, params.cpu().numpy(), *ansatz_fixed_param).expectation())
+                        num_iter += 1
+                        if mode == "X":
+                            expectation_eval = float(cudaq.observe(kernel_qaoa_use, H_eval, params.cpu().numpy(), *ansatz_fixed_param).expectation())
+                        else:
+                            expectation_eval = expectation
+                        expectation_lamb = float(cudaq.observe(kernel_qaoa_use, H_lamb, params.cpu().numpy(), *ansatz_fixed_param).expectation()) / hamiltonian_boost
+                        expectation_violate = sqrt(expectation_lamb / lamb)
+                        grad = torch.zeros_like(params)
+                        for j in range(parameter_count):
+                            shift = np.zeros(parameter_count)
+                            shift[j] = SHIFT
+                            forward = float(cudaq.observe(kernel_qaoa_use, H_ansatz, (params.cpu().numpy() + shift), *ansatz_fixed_param).expectation())
+                            grad[j] = (forward - expectation) / SHIFT
+                        points_cu.grad = grad
+                        optimizer_cu.step()
+                        scheduler_all.step()
+                        expectations.append([expectation/hamiltonian_boost, expectation_eval/hamiltonian_boost, expectation_lamb, points_cu[0].item(), points_cu[1].item()])
 
-            mi_r, ma_r = state_eval[idx_feasible].min(), state_eval[idx_feasible].max()
-            optimal_expectation = (prob * (state_eval)).sum()
+                        cou_con = cou_con + 1 if last_f is not None and abs(expectation - last_f) < F_TOL else 0
+                        if cou_con >= 3:
+                            break
+                        last_f = expectation
 
-            if len(idx_feasible[0]) >= 2:
-                approx_ratio = (optimal_expectation - mi_r) / (ma_r - mi_r)
-                maxprob_ratio = (state_eval[int(idx_best, 2)] - mi_r) / (ma_r - mi_r)
-            else:
-                approx_ratio, maxprob_ratio = np.nan, np.nan
-            budget_violation = float(cudaq.observe(kernel_qaoa_use, H_lamb, optimal_parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
-            return_final = -float(cudaq.observe(kernel_qaoa_use, H_return, optimal_parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
-            risk_final = float(cudaq.observe(kernel_qaoa_use, H_risk, optimal_parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
-            #
-            observe_time = time.time() - st
+                        if is_pbar:
+                            pbar_optim.set_description(f"Iter {it}, Exp_obj {expectation/hamiltonian_boost:.6f}, Exp_eval {expectation_eval/hamiltonian_boost:.6f}, Exp_lamb {expectation_lamb:.6f}, LR {optimizer_cu.param_groups[0]['lr']:.4f}")
+                    optimal_parameters = points_cu.cpu().numpy()
 
-            # update df_now for simultaneously run experiments
-            df_now = pd.read_csv(f"{dir_path}/{report_name}") if os.path.exists(f"{dir_path}/{report_name}") else pd.DataFrame(columns=report_col)
+                if mode == "Ramp":
+                    # LR-QAOA: no optimization — evaluate the linear-ramp schedule once.
+                    optimal_parameters = np.zeros(2 * layer_count)
+                    for itt in range(layer_count):
+                        optimal_parameters[itt] = delta_gamma * (itt+1) / layer_count
+                        optimal_parameters[layer_count + itt] = delta_beta * (1 - itt/layer_count)
+                    expectation = float(cudaq.observe(kernel_qaoa_use, H_ansatz, optimal_parameters, *ansatz_fixed_param).expectation())
+                    expectation_eval = float(cudaq.observe(kernel_qaoa_use, H_eval, optimal_parameters, *ansatz_fixed_param).expectation())
+                    expectation_lamb = float(cudaq.observe(kernel_qaoa_use, H_lamb, optimal_parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
+                    expectations.append([expectation/hamiltonian_boost, expectation_eval/hamiltonian_boost, expectation_lamb, optimal_parameters[0], optimal_parameters[1]])
 
-            # remove row such that Assets and Exp match
-            df_now = df_now[~((df_now["Assets"] == N_ASSETS) & (df_now["Exp"] == e))]
-            
-            df_now.loc[-1] = [N_ASSETS, e, n_qubit, approx_ratio, return_final, risk_final, budget_violation, B, maxprob_ratio, init_1_time, init_2_time, optim_time, num_iter, observe_time]
-            df_now.sort_values(by=["Assets", "Exp"], inplace=True)
-            df_now.reset_index(drop=True, inplace=True)
-            df_now.to_csv(f"{dir_path}/{report_name}", index=False)
+                if os.path.exists(f"{dir_path}/{expect_name}"):
+                    curr_expect = np.load(f"{dir_path}/{expect_name}")
+                else:
+                    curr_expect = {}
+                curr_expect = dict(curr_expect)
+                curr_expect[f'A{N_ASSETS}_p{LAYER}_E{e}_S{i_s}_b{hamiltonian_boost}'] = np.array(expectations)
+                curr_expect[f'A{N_ASSETS}_p{LAYER}_E{e}_S{i_s}_b{hamiltonian_boost}_params'] = np.array(optimal_parameters)
+                np.savez_compressed(f"{dir_path}/{expect_name}", **curr_expect)
+                optim_time = time.time() - st
+
+                if is_pbar:
+                    pbar_exp.set_description("observe")
+                st = time.time()
+                result = cudaq.get_state(kernel_qaoa_use, optimal_parameters, *ansatz_fixed_param)
+                idx_r_best = np.argmax(np.abs(result))
+                idx_best = bin(idx_r_best)[2:].zfill(n_qubit)[::-1]
+
+                result_r = cudaq.get_state(kernel_flipped, result, TARGET_QUBIT)
+                prob = np.abs(result_r)**2
+                prob_optimal = prob[idx_optimal]
+
+                if len(idx_feasible[0]) >= 2:
+                    mi_r, ma_r = state_eval[idx_feasible].min(), state_eval[idx_feasible].max()
+                    optimal_expectation = (prob * (state_eval)).sum()
+                    approx_ratio = (optimal_expectation - mi_r) / (ma_r - mi_r)
+                    maxprob_ratio = (state_eval[int(idx_best, 2)] - mi_r) / (ma_r - mi_r)
+                else:
+                    approx_ratio, maxprob_ratio = np.nan, np.nan
+                budget_violation = float(cudaq.observe(kernel_qaoa_use, H_lamb, optimal_parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
+                return_final = -float(cudaq.observe(kernel_qaoa_use, H_return, optimal_parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
+                risk_final = float(cudaq.observe(kernel_qaoa_use, H_risk, optimal_parameters, *ansatz_fixed_param).expectation()) / hamiltonian_boost
+                #
+                observe_time = time.time() - st
+
+                # update df_now for simultaneously run experiments
+                df_now = pd.read_csv(f"{dir_path}/{report_name}") if os.path.exists(f"{dir_path}/{report_name}") else pd.DataFrame(columns=report_col)
+
+                # remove row such that Assets, Layer, Exp, Seed and Boost match
+                df_now = df_now[~((df_now["Assets"] == N_ASSETS) & (df_now["Layer"] == LAYER) & (df_now["Exp"] == e) & (df_now["Seed"] == i_s) & (df_now["Boost"] == hamiltonian_boost))]
+                df_now.loc[-1] = [N_ASSETS, LAYER, e, i_s, n_qubit, hamiltonian_boost, approx_ratio, prob_optimal, return_final, risk_final, budget_violation, B, maxprob_ratio, init_1_time, init_2_time, optim_time, num_iter, observe_time]
+                df_now.sort_values(by=["Assets", "Layer", "Exp"], inplace=True)
+                df_now.reset_index(drop=True, inplace=True)
+                df_now.to_csv(f"{dir_path}/{report_name}", index=False)

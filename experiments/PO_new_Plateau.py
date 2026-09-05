@@ -135,7 +135,8 @@ def main() -> None:
 
     returns_price, covariance = load_universe(MIN_PRICE, MAX_PRICE)
     cov_no_ticker = covariance.drop("Ticker", axis=1)
-    ret_no_ticker = returns_price.drop("Ticker", axis=1)
+    # Company_Name is a string column — dropping it keeps the ndarray numeric.
+    ret_no_ticker = returns_price.drop(["Ticker", "Company_Name"], axis=1)
 
     dir_name = f"exp_p{layer_count}_L{_format_param(lamb)}_q{_format_param(q_weight)}"
     dir_path = (

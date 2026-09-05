@@ -22,8 +22,9 @@ The repository contains:
 - **`experiments/`** — runnable Python scripts for the three experiment families plus figure-generation scripts:
   - `PO_Mixer_Benchmark.py` — SP-baseline benchmarks across mixers and depths.
   - `PO_X_Plateau.py`, `PO_new_Plateau.py` — barren-plateau diagnostics (variance scaling vs. qubit count).
-  - `PO_new_ApproxRatio.py` — SC-QAOA approximation-ratio sweeps.
+  - `PO_new_ApproxRatio.py` — SC-QAOA approximation-ratio sweeps, covering the soft-penalty (`X`), subspace-confined (`Preserving`), and training-free linear-ramp (`Ramp`, LR-QAOA) ansätze.
   - `PO_random_solution.py` — randomized admissible-portfolio reference cloud used in §08 of the paper.
+  - `merge_split_results.py` — stitches the outputs of parallel `-post` slices back into one results folder.
   - `make_fig2_trainability.py`, `make_fig3_ga_quality.py` — read the cached experiment outputs and produce the paper figures.
   - `models/` — small pickled artefacts (`gaussian_copula*.pkl`) used by the figure-generation scripts.
 - **`scripts/`** — three parameterized shell scripts that orchestrate the multi-configuration sweeps used to produce the paper's figures.
@@ -106,7 +107,13 @@ This writes:
 - `dataset/top_50_us_stocks_returns_price.csv` — per-ticker mean return + last close + name
 - `dataset/top_50_us_stocks_data_20250526_011226_covariance.csv` — daily-return covariance matrix
 
-> **Note.** The `TICKERS` list at the top of `prepare_data.py` is a default placeholder of large-cap US equities. **Edit it to match the exact 50-ticker universe used in the paper** before running this step if you intend to reproduce the published numbers.
+> ### ⚠️ The shipped ticker list is a placeholder — published numbers will not reproduce
+>
+> The `TICKERS` list at the top of `prepare_data.py` is a **placeholder** of large-cap US equities chosen to span a price range comparable to the paper's `[108, 216]` USD band. It is **not** the 50-ticker universe used in the paper, and no dataset is distributed with this repository.
+>
+> As shipped, the pipeline therefore runs end-to-end as a **smoke test** — every stage executes and produces well-formed output — but **none of the numbers, tables or figures will match the published results.**
+>
+> To reproduce the paper you need the original universe and the price snapshot it was built from. Note that re-downloading from Yahoo Finance will not recover it even with the correct tickers: adjusted-close series are revised over time by splits and dividend adjustments, so a fetch today yields different returns and covariances than the 2025-05-26 snapshot the paper used. Please contact the authors for the exact dataset.
 
 ### Stage 2 — Run the experiments
 
@@ -148,15 +155,52 @@ bash ../scripts/run_plateau.sh preserving             # Preserving-mixer plateau
 #### Subspace-confined QAOA (§04, §07, §08)
 
 ```shell
-python PO_new_ApproxRatio.py -Q 10 -A 3 -K 12
+python PO_new_ApproxRatio.py -Q 2 -A 6 -m Preserving -B 24
 ```
 
-`-K` = working-subspace dimension (the paper reports `K ∈ {12, 24}`). The orchestration script `../scripts/run_approx.sh` provides the canonical presets:
+`-B` = working-subspace dimension `K` (the paper reports `K ∈ {12, 24}`), `-m` selects the ansatz:
+
+| `-m` | Ansatz |
+|------|--------|
+| `X` | Soft-penalty baseline — budget enters the cost Hamiltonian as `λ · H_penalty`, standard transverse-field mixer. |
+| `Preserving` | Subspace-confined QAOA — the mixer confines the dynamics to `S_ε`; no `λ` to tune. |
+| `Ramp` | Linear-Ramp QAOA (LR-QAOA) — no optimization; the schedule `γ_i = δγ·(i+1)/p`, `β_i = δβ·(1 − i/p)` is evaluated once as a training-free reference. |
+
+**Hamiltonian scaling.** Adam runs at a fixed step size, so the factor the cost Hamiltonian is scaled by sets the effective gradient magnitude. Instead of hand-tuning one boost per `(λ, A)` cell, `-norm` derives it from the Ising couplings:
+
+| `-norm` | Boost |
+|---------|-------|
+| `J` | `1 / max|J_ij|` |
+| `Jh` | `1 / max(max|J_ij|, max|h_i|)` — recommended |
+| `h` | `1 / max|h_i|` |
+| `fixed` | the literal `-b_X` / `-b_P` / `-b_R` value (default) |
+
+`-lr_s` multiplies the derived boost on top, and `-wd` sets Adam's weight decay. All reported expectation values are divided back out by the boost, so runs stay comparable across normalization modes. `--LR_init` starts the optimizer from the linear-ramp schedule (`-d_b`, `-d_g`) rather than from zeros; `--random_init` starts from a random point. `-seed N` repeats each cell with `N` independent initializations.
+
+The orchestration script `../scripts/run_approx.sh` provides the canonical presets:
 
 ```shell
 bash ../scripts/run_approx.sh preserving_K24          # main SC-QAOA config (Fig 5)
 bash ../scripts/run_approx.sh x_baseline              # SP-baseline comparison (Fig 5)
+bash ../scripts/run_approx.sh lr_x_sweep              # X mixer, linear-ramp init, (A × λ × p) sweep
+bash ../scripts/run_approx.sh lr_preserving_sweep     # Preserving mixer, linear-ramp init, (A × p) sweep
 ```
+
+Results land under `<root>/exp_L<λ>_q<q>/` as `report_<mode>_boost_<norm>.csv` plus a matching `expectation_*.npz`. The root directory name encodes the run configuration (init scheme, LR scale, weight decay, normalization mode) so concurrent sweeps do not collide; `-root` overrides it.
+
+#### Splitting a sweep across GPUs
+
+Give each slice its own `-post` tag and a disjoint `-e_list`, then merge:
+
+```shell
+CUDA_VISIBLE_DEVICES=0 python PO_new_ApproxRatio.py ... -post job1 -e_list 0 1 2 3 4 &
+CUDA_VISIBLE_DEVICES=1 python PO_new_ApproxRatio.py ... -post job2 -e_list 5 6 7 8 9 &
+wait
+python merge_split_results.py -root <root> -post job1 job2 --dry_run   # preview
+python merge_split_results.py -root <root> -post job1 job2
+```
+
+Rows are de-duplicated on `(Assets, Layer, Exp, Seed, Boost)` and `.npz` keys are merged, with split-run entries winning on conflict.
 
 #### Random admissible reference cloud (§08)
 
@@ -189,7 +233,35 @@ python make_fig3_ga_quality.py
 | Fig. 2 — Trainability | `make_fig2_trainability.py` |
 | Fig. 3 — GA timing & quality | `make_fig3_ga_quality.py` |
 
-The scripts retain their original cell structure as `# %% [code cell N]` markers, so they can also be opened in VS Code's Interactive Window or Spyder for cell-by-cell exploration. They expect outputs from Stage 2 to already exist on disk; they do not run any experiments themselves.
+The scripts retain their original cell structure as `# %% [code cell N]` markers, so they can also be opened in VS Code's Interactive Window or Spyder for cell-by-cell exploration.
+
+Both scripts run one optimizer per invocation, cache its trace under `./output_PO/` (Fig. 3) or `./output_PO_mixer/` (Fig. 2), then plot every cached trace they find. Reproducing the full comparison panel therefore means running each script once per optimizer index (`Nelder-Mead, COBYLA, SPSA, Adam, GradientDescent`):
+
+```shell
+for i in 0 1 2 3 4; do SCQAOA_OPTIMIZER_IDX=$i python make_fig3_ga_quality.py; done
+```
+
+Both seed `numpy` and CUDA-Q with 42, so repeated runs give identical figures.
+
+## Reproducibility
+
+Given a fixed dataset, every stage of the pipeline is deterministic — repeated runs on the same machine produce bit-identical CSV and `.npz` output.
+
+| Source of randomness | How it is controlled |
+|---|---|
+| Asset subset, budget draw | `np.random.seed(911 + 991·e + 997·A)` — unique but reproducible per (experiment, asset count). |
+| Variational parameter init | `np.random.seed(4001 + 4099·e + 4999·A + 5099·s)` — adds the seed index `s` from `-seed N`. |
+| GA subspace selection | `ga_solver.GeneticAlgorithm(..., seed=919 + 991·e + 997·A)`. The C++ RNG defaults to `std::random_device` when no seed is passed; the experiment scripts always pass one. |
+| Figure scripts | `np.random.seed(42)` and `cudaq.set_random_seed(42)` — the latter governs the 1e6-shot `cudaq.sample()` calls. |
+| Optimizer (torch-Adam) | No torch RNG is used; initial points come from the numpy stream above. Gradients are exact statevector expectations, not sampled. |
+
+Caveats worth knowing before comparing numbers:
+
+- **The dataset is the limiting factor**, not the code — see the warning in Stage 1.
+- **Rebuild `ga_solver` after pulling**, or the GA seed argument will be missing from your compiled extension: `cd ga_solver && pip install -e . && cd ..`.
+- **Versions are unpinned** in `environment.yml`. Results depend most on the `cuda-quantum-cu12`, `torch` and `numpy` versions; see the note at the bottom of that file for capturing an exact lock.
+- **Across different GPUs**, floating-point reduction order in the CUDA-Q statevector simulator can differ, so expect agreement to ~1e-10 rather than bit-identity when changing hardware.
+- `ga_solver/BF_benchmark.cpp` is a standalone brute-force comparison, not built by `pip install -e .`. It includes the GCC-only `<bits/stdc++.h>`, so it needs `g++` (not `clang++`) to compile.
 
 ## Repository layout
 
@@ -206,6 +278,7 @@ The scripts retain their original cell structure as `# %% [code cell N]` markers
 ├── ga_solver/                  # C++ / pybind11 GA preprocessing extension
 ├── experiments/                # Stages 2 & 3: experiment + figure-generation scripts
 │   ├── PO_*.py                 #   experiment scripts
+│   ├── merge_split_results.py  #   merge parallel (-post) slices back together
 │   ├── make_fig2_trainability.py    # Fig. 2 generator
 │   ├── make_fig3_ga_quality.py      # Fig. 3 generator
 │   └── models/                 #   small pickled artefacts

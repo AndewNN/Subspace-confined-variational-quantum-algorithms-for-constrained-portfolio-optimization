@@ -587,6 +587,18 @@ def clip_df(df, restore_iter):
     df = df.iloc[:restore_iter]
     return df
 
+def to_sig(x, sig=3):
+    """Round ``x`` to ``sig`` significant figures, returning an int when exact.
+
+    Used to keep auto-derived Hamiltonian boost factors short and stable, so
+    they round-trip identically through the report CSV / npz key names that
+    embed them.
+    """
+    x = float(x)
+    res = float(f"{x:.{sig}}")
+    res = int(res) if res.is_integer() else res
+    return res
+
 
 # Optional: a test routine when the module is executed as a script.
 if __name__ == "__main__":

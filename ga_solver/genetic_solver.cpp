@@ -39,7 +39,8 @@ public:
         double mutation_rate,
         double crossover_rate,
         int elitism_count,
-        int tournament_size
+        int tournament_size,
+        int seed = -1
     ) : n_assets(prices.size()),
         asset_bit_lengths(asset_bit_lengths),
         prices(prices),
@@ -50,8 +51,11 @@ public:
         elitism_count(elitism_count),
         tournament_size(tournament_size),
         total_bits(0),
-        rng(std::random_device{}())
-        // rng(919)
+        // seed < 0 draws a fresh non-deterministic seed; any seed >= 0 makes
+        // the whole GA run reproducible. The experiment scripts always pass an
+        // explicit seed derived from (experiment, asset count).
+        rng(seed < 0 ? std::mt19937::result_type(std::random_device{}())
+                     : std::mt19937::result_type(seed))
     {
         start_ga = clk::now();
         if (prices.empty() || prices.size() != asset_bit_lengths.size()) {
@@ -410,7 +414,7 @@ PYBIND11_MODULE(ga_solver, m) {
         });
 
     py::class_<GeneticAlgorithm>(m, "GeneticAlgorithm")
-        .def(py::init<const std::vector<double>&, const std::vector<int>&, double, int, double, double, int, int>(),
+        .def(py::init<const std::vector<double>&, const std::vector<int>&, double, int, double, double, int, int, int>(),
              py::arg("prices"),
              py::arg("asset_bit_lengths"),
              py::arg("budget"),
@@ -418,7 +422,8 @@ PYBIND11_MODULE(ga_solver, m) {
              py::arg("mutation_rate"),
              py::arg("crossover_rate"),
              py::arg("elitism_count"),
-             py::arg("tournament_size"))
+             py::arg("tournament_size"),
+             py::arg("seed") = -1)
         .def("run", &GeneticAlgorithm::run,
              py::arg("generations"), py::arg("verbose") = true,
              "Run the genetic algorithm for a number of generations.")

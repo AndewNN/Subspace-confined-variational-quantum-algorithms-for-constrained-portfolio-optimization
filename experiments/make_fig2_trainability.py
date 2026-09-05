@@ -2,6 +2,9 @@
 
 Run from the experiments/ directory so relative paths to ../dataset/,
 ./models/, and ./output_PO_* resolve correctly.
+
+Runs one optimizer per invocation (``SCQAOA_OPTIMIZER_IDX``, default 3),
+caches its trace to ./output_PO_mixer/, then plots every cached trace.
 """
 
 import numpy as np
@@ -31,6 +34,8 @@ import time
 cudaq.set_target("nvidia")
 
 np.random.seed(42)
+# cudaq's own RNG drives the 1e6-shot cudaq.sample() further down.
+cudaq.set_random_seed(42)
 
 # !! warning: Representing Pauli words using INTEGER !!
 
@@ -481,7 +486,9 @@ print(cudaq.draw(kernel_qaoa_Preserved, [1]*4, n_qubit, 1, idx_1_use, coeff_1_us
 
 # # Ansatz Architecture
 
-idx = 3
+# Which optimizer to run this invocation; see Utils.qaoaCUDAQ.optimizer_names.
+OPTIMIZER_IDX = int(os.environ.get("SCQAOA_OPTIMIZER_IDX", 3))
+idx = OPTIMIZER_IDX
 layer_count = 5
 ansatz_idx = 0
 
