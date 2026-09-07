@@ -27,7 +27,8 @@ output_PO/
 output_PO_mixer/
 results/
 experiments_*/
-dataset/
+# dataset/ is tracked: the two CSVs the paper was built from are shipped with
+# the repository so results do not depend on a live Yahoo Finance API.
 *.npy
 *.cbin
 *.zip

@@ -28,7 +28,8 @@ The repository contains:
   - `make_fig2_trainability.py`, `make_fig3_ga_quality.py` — read the cached experiment outputs and produce the paper figures.
   - `models/` — small pickled artefacts (`gaussian_copula*.pkl`) used by the figure-generation scripts.
 - **`scripts/`** — three parameterized shell scripts that orchestrate the multi-configuration sweeps used to produce the paper's figures.
-- **`prepare_data.py`** — one-shot script that fetches the daily-price universe from Yahoo Finance and produces the two CSVs the experiments expect under `dataset/`.
+- **`dataset/`** — the two CSVs the published results were computed from (50-ticker universe, 2025-05-26 snapshot), with `SHA256SUMS` for verification.
+- **`prepare_data.py`** — optional: rebuilds those CSVs from Yahoo Finance. Not needed to reproduce the paper.
 
 ## Citation
 
@@ -94,26 +95,28 @@ python -c "import cudaq, ga_solver; from Utils.qaoaCUDAQ import po_normalize; pr
 
 The pipeline runs in three ordered stages: **prepare data → run experiments → open notebooks**.
 
-### Stage 1 — Prepare the dataset
+### Stage 1 — Dataset (already included)
 
-`prepare_data.py` downloads daily prices for a configurable list of US equities from Yahoo Finance (default range 2015-04-01 to 2025-04-01) and produces the two CSV files the experiment scripts expect under `./dataset/`.
+**No action needed.** The two CSV files the experiments read are committed under `dataset/`:
+
+- `dataset/top_50_us_stocks_returns_price.csv` — per-ticker mean daily return, last close, and name (50 tickers)
+- `dataset/top_50_us_stocks_data_20250526_011226_covariance.csv` — the 50 x 50 daily-return covariance matrix
+
+These are the exact files the published results were computed from, snapshotted on 2025-05-26 over the window 2015-04-01 to 2025-04-01. They are shipped with the repository deliberately, so that reproducing the paper does not depend on a third-party API that may change or revise its history. Verify them with:
 
 ```shell
-# from the repo root
-python prepare_data.py
+cd dataset && shasum -a 256 -c SHA256SUMS && cd ..
 ```
 
-This writes:
-- `dataset/top_50_us_stocks_returns_price.csv` — per-ticker mean return + last close + name
-- `dataset/top_50_us_stocks_data_20250526_011226_covariance.csv` — daily-return covariance matrix
+#### Optional: rebuilding the dataset from source
 
-> ### ⚠️ Re-downloading will not exactly reproduce the published numbers
->
-> `TICKERS` in `prepare_data.py` **is** the 50-ticker universe used in the paper, but no dataset CSVs are distributed with this repository — `prepare_data.py` re-fetches them from Yahoo Finance.
->
-> Yahoo's adjusted-close series are revised over time by splits and dividend adjustments, so a fetch today yields slightly different mean returns and covariances than the 2025-05-26 snapshot the paper was built on. Results will be close but **not identical** to the published tables and figures.
->
-> For exact reproduction, request the original two CSVs from the authors and drop them into `dataset/`, skipping Stage 1 entirely.
+`prepare_data.py` re-downloads daily prices from Yahoo Finance for the same 50 tickers and rebuilds both CSVs. It is provided to document how the shipped data was constructed, and is **not** part of the reproduction path.
+
+```shell
+python prepare_data.py --out-dir dataset_rebuilt   # writes elsewhere; does not overwrite
+```
+
+> **Note.** A rebuild will not reproduce the shipped files bit-for-bit. Yahoo revises adjusted-close series over time for splits and dividends, so a fetch today yields slightly different mean returns and covariances than the 2025-05-26 snapshot. Use the committed CSVs to reproduce the paper; use `prepare_data.py` only to extend the study to a different universe or date range.
 
 ### Stage 2 — Run the experiments
 
@@ -270,7 +273,8 @@ Caveats worth knowing before comparing numbers:
 ├── README.md
 ├── LICENSE
 ├── environment.yml
-├── prepare_data.py             # Stage 1: fetch dataset from Yahoo Finance
+├── prepare_data.py             # optional: rebuild dataset/ from Yahoo Finance
+├── dataset/                    # the CSVs the paper was computed from (+ SHA256SUMS)
 ├── .gitignore
 ├── assets/
 │   └── teaser.png
