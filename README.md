@@ -30,6 +30,7 @@ The repository contains:
 - **`scripts/`** — three parameterized shell scripts that orchestrate the multi-configuration sweeps used to produce the paper's figures.
 - **`dataset/`** — the two CSVs the published results were computed from (50-ticker universe, 2025-05-26 snapshot), with `SHA256SUMS` for verification.
 - **`prepare_data.py`** — optional: rebuilds those CSVs from Yahoo Finance. Not needed to reproduce the paper.
+- **`build_dataset_from_raw.py`** — the derivation that actually produced `dataset/`, from a raw daily-bar file; `--verify` checks a candidate raw file against the shipped CSVs.
 
 ## Citation
 
@@ -107,6 +108,24 @@ These are the exact files the published results were computed from, snapshotted 
 ```shell
 cd dataset && shasum -a 256 -c SHA256SUMS && cd ..
 ```
+
+#### Provenance of the shipped files
+
+The two CSVs are derived from a raw long-format daily-bar file with columns
+
+```
+Date, Ticker, Close, Daily_Return, Company_Name
+```
+
+restricted to 2015-04-01 … 2025-04-01. `Average_Return` is the mean `Daily_Return` per ticker over that window, `Price` is the last `Close`, and the covariance matrix is the covariance of `Daily_Return` across tickers. `build_dataset_from_raw.py` performs exactly this derivation:
+
+```shell
+python build_dataset_from_raw.py path/to/raw_with_returns.csv --verify
+```
+
+`--verify` regenerates the two CSVs from a candidate raw file and compares them against the shipped ones, exiting 0 on a match. Use it to confirm that a recovered raw archive is the file the published results came from.
+
+> **Note.** The raw daily-bar file is not currently distributed with this repository. The shipped CSVs are sufficient to reproduce every result in the paper; the raw file is needed only to re-derive them over a different window, or to audit the derivation itself.
 
 #### Optional: rebuilding the dataset from source
 
